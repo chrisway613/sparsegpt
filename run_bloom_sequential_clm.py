@@ -20,10 +20,12 @@ from accelerate.utils import set_seed
 from accelerate.logging import get_logger
 from accelerate import Accelerator, InitProcessGroupKwargs
 
-from transformers import SchedulerType, default_data_collator
+from transformers import default_data_collator
 from transformers.models.bloom import BloomConfig, BloomTokenizerFast, BloomForCausalLM
 
-from sequential import SequentialForward, BloomSequential
+from sequential import SequentialForward, SparseBloomSequential
+# from sequential_single_gpu_fp32 import SequentialForward, SparseBloomSequential
+# from sequential_single_gpu_amp import SequentialForward, SparseBloomSequential
 
 
 logger = get_logger(__name__)
@@ -60,8 +62,9 @@ def sequential_eval(seq_model: SequentialForward, dataset, dataloader, accelerat
     losses = []
     for batch in tqdm(dataloader, disable=not accelerator.is_local_main_process):
         loss = seq_model.forward(batch, train=False, **kwargs)
+        batch_size = batch['input_ids'].size(0)
         # (num_devices*batch_size,)
-        losses.append(accelerator.gather(loss.repeat(dataloader.batch_size)))
+        losses.append(accelerator.gather(loss.repeat(batch_size)).cpu())
 
     losses = torch.cat(losses)
     losses = losses[:len(dataset)]
@@ -89,7 +92,7 @@ def parse_args():
         help="Path to pretrained model or model identifier from huggingface.co/models."
     )
     parser.add_argument(
-        "model_cache_dir",
+        "--model_cache_dir",
         type=str,
         default=None,
         help="Directory of model weights to be cached in."
@@ -117,9 +120,15 @@ def parse_args():
     
     # Train
     parser.add_argument(
+        "--num_train_epochs",
+        type=int,
+        required=True,
+        help="Number of training epochs."
+    )
+    parser.add_argument(
         "--max_seq_length",
         type=int,
-        default=256,
+        default=512,
         help="Max sequence length of a data sample."
     )
     parser.add_argument(
@@ -155,6 +164,11 @@ def parse_args():
 
     # Prune
     parser.add_argument(
+        "--sparse",
+        action="store_true",
+        help="Do pruning."
+    )
+    parser.add_argument(
         '--num_prune_samples', type=int, default=128,
         help='Number of calibration data samples for pruning.'
     )
@@ -175,6 +189,12 @@ def parse_args():
         help='Target sparsities.'
     )
     parser.add_argument(
+        '--sparse_steps',
+        nargs="*",
+        type=int,
+        help='Step that execute pruning.'
+    )
+    parser.add_argument(
         '--prunen', type=int, default=0,
         help='N for N:M pruning.'
     )
@@ -187,11 +207,11 @@ def parse_args():
         help='Whether to run the GMP baseline.'
     )
     parser.add_argument(
-        '--minlayer', type=int, default=-1,
+        '--min_layer', type=int, default=-1,
         help='Prune all layers with id >= this.'
     )
     parser.add_argument(
-        '--maxlayer', type=int, default=1000,
+        '--max_layer', type=int, default=1000,
         help='Prune all layers with id < this.'
     )
     parser.add_argument(
@@ -199,10 +219,10 @@ def parse_args():
         help='Prune only layers that contain this text.'
     )
     parser.add_argument(
-        "max_prune_steps",
-        type=int,
-        default=1000,
-        help="Maximum number of pruning steps for a block."
+        "--path_to_dense",
+        type=str,
+        default="bloom-dense",
+        help="Path to dense weigths."
     )
 
     # Global
@@ -210,6 +230,11 @@ def parse_args():
         '--eval_dense',
         action='store_true',
         help="Do evaluation for dense model."
+    )
+    parser.add_argument(
+        "--dump_dense",
+        action="store_true",
+        help="Record dense weights to a specified path."
     )
     parser.add_argument(
         "--eval_only",
@@ -235,7 +260,7 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="bloom_outputs",
+        default="bloom-outputs",
         help="Where to store the results."
     )
 
@@ -246,7 +271,7 @@ def parse_args():
 if __name__ == '__main__':
     # Parse arguments
     args = parse_args()
-    logger.info(f"Target sparsity: {args.sparsity}\n")
+    logger.info(f"Target sparsities: {args.sparsities}\n")
 
     # Accelerator(for distributed training)
     kwargs_handlers = [InitProcessGroupKwargs(timeout=timedelta(seconds=180000))]
@@ -268,8 +293,14 @@ if __name__ == '__main__':
 
     # Random seed
     set_seed(args.seed)
-    # Make output directory if not existed
-    os.makedirs(args.output_dir, exist_ok=True)
+
+    if args.debug:
+        # Only 16 samples will be used to debug
+        args.num_prune_samples = 16
+        args.per_device_prune_batch_size = 16
+    else:
+        # Make output directory if not existed
+        os.makedirs(args.output_dir, exist_ok=True)
 
     accelerator.wait_for_everyone()
 
@@ -277,7 +308,7 @@ if __name__ == '__main__':
     with StateStdout(logger=logger, begin="Loading datset", end="Done"):
         data = load_dataset(
             args.dataset_name, args.dataset_config_name,
-            cache_dir=args.cache_dir, use_auth_token=True
+            cache_dir=args.data_cache_dir, use_auth_token=True
         )
         if 'validation' not in data:
             # val : train = 5% : 95%
@@ -288,9 +319,6 @@ if __name__ == '__main__':
 
             data['validation'] = data['train'].select(val_indices)
             data['train'] = data['train'].select(train_indices)
-        if not args.eval_full_data:
-            data['validation'] = data['validation'].select(range(1000))
-            logger.info("NOTE: only 1000 samples of validation data selected.")
 
     # Tokenize data texts
     tokenizer = BloomTokenizerFast.from_pretrained(args.model_name_or_path, cache_dir=args.model_cache_dir)
@@ -302,7 +330,7 @@ if __name__ == '__main__':
         data = data.map(
             lambda samples: tokenizer(samples[text_column_name]),
             batched=True,
-            num_proc=128,
+            num_proc=8,
             remove_columns=column_names,
             load_from_cache_file=True,
             desc="Running tokenizer on dataset"
@@ -340,20 +368,29 @@ if __name__ == '__main__':
         data = data.map(
             group_texts,
             batched=True,
-            num_proc=128,
+            num_proc=8,
             load_from_cache_file=True,
             desc=f"Grouping texts in chunks of {args.max_seq_length}",
         )
     
     # Data split
-    val_data = data['train']
+    val_data = data['validation']
+    if not args.eval_full_data and len(val_data) > 1280:
+        data['validation'] = data['validation'].select(range(1280))
+        logger.info("NOTE: only 1280 samples of validation data selected.")
     if not args.eval_only:
-        train_data = data['validation']
-        if args.debug:
-            train_data = train_data.select(range(128))
-            # NOTE: debug=overfit
-            val_data = train_data
+        train_data = data['train']
+    if args.debug:
+        train_data = data['train'].select(range(96))
+        # NOTE: debug=overfit
+        val_data = train_data
+        logger.info(f"NOTE: debug mode on! only 96 train(eval) data samples selected.\n")
     
+    logger.info(f"\tNum validation data = {len(val_data)}")
+    if not args.eval_only:
+        logger.info(f"\tNum training data = {len(train_data)}")
+    logger.info("\n")
+
     # Log a few random samples from the training set:
     for index in random.sample(range(len(train_data)), 3):
         logger.info(f"Sample {index} of the training data: {train_data[index]}.")
@@ -373,11 +410,11 @@ if __name__ == '__main__':
     # NOTE: this is inherit from sparsegpt, but I don't know the reason
     disable_torch_init()
 
-    model_config = BloomConfig.from_pretrained(args.model_path_or_name, cache_dir=args.model_cache_dir)
+    model_config = BloomConfig.from_pretrained(args.model_name_or_path, cache_dir=args.model_cache_dir)
     model = BloomForCausalLM.from_pretrained(
-        args.model_path_or_name,
-        conig=model_config,
-        torch_dtype='auto',
+        args.model_name_or_path,
+        config=model_config,
+        # torch_dtype='auto',
         cache_dir=args.model_cache_dir
     )
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
@@ -388,7 +425,7 @@ if __name__ == '__main__':
     logger.info(f"\nModel structure:\n{model}\n")
 
     # Model that performs sequential forwarding
-    sequential_model = BloomSequential(model, accelerator, logger=logger)
+    sequential_model = SparseBloomSequential(model, accelerator, logger=logger, dense_dir=args.path_to_dense)
 
     # Data parallel
     eval_dataloader = accelerator.prepare(eval_dataloader)
@@ -411,7 +448,7 @@ if __name__ == '__main__':
 
     logger.info("\n***** BEGIN *****")
     logger.info(f"  Num examples = {num_examples}")
-    logger.info(f"  Instantaneous batch size per device = {args.per_device_batch_size}")
+    logger.info(f"  Instantaneous batch size per device = {per_device_batch_size}")
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     if not args.eval_only:
         logger.info(f"  Num Epochs = {args.num_train_epochs}")
@@ -425,9 +462,17 @@ if __name__ == '__main__':
             sequential_eval(sequential_model, val_data, eval_dataloader, accelerator)
     # Train
     else:
+        if args.dump_dense:
+            os.makedirs(args.path_to_dense, exist_ok=True)
+            with StateStdout(logger=logger, begin=f"Dumping dense to {args.path_to_dense}"):
+                for i, layer in tqdm(
+                    enumerate(sequential_model.model.transformer.h),
+                    disable=not accelerator.is_local_main_process
+                ):
+                    torch.save(layer.state_dict(), os.path.join(args.path_to_dense, f"layer_{i}"))
+        
         completed_step = 0
-        if args.sparse:
-            completed_prune_times = 0
+        completed_prune_times = 0
 
         # Only show the progress bar once on each machine.
         progress_bar = tqdm(range(total_steps), disable=not accelerator.is_local_main_process)
@@ -438,55 +483,105 @@ if __name__ == '__main__':
             return max(0.0, float(total_steps - completed_step)) / float(max(1, total_steps - args.num_warmup_steps))
 
         for epoch in range(args.num_train_epochs):
+            # Loss yeild by each layer
+            layer_losses = [0.] * len(sequential_model.model.transformer.h)
+            # Cosine similarity between each layer's output hidden states of sparse & dense
+            layer_similarities = [0.] * len(sequential_model.model.transformer.h)
+
             for step, batch in enumerate(train_dataloader):
                 # Pruning when meeting a specified step
                 if args.sparse and completed_prune_times < len(args.sparsities) \
-                    and completed_step % args.sparse_steps[completed_prune_times] == 0:
+                    and completed_step == args.sparse_steps[completed_prune_times]:
                     target_indices = random.sample(range(len(train_data)), args.num_prune_samples)
                     prune_data = train_data.select(target_indices)
-                    logger.info(f"NOTE: {args.num_prune_samples} samples of training data selected to be pruning data.\n")
-                    
+                    # TODO: accelerate.prepare()
                     prune_dataloader = DataLoader(
                         prune_data, batch_size=args.per_device_prune_batch_size,
                         collate_fn=default_data_collator, pin_memory=True, num_workers=8
                     )
-                    with StateStdout(logger=logger, begin=f"Pruning to sparsity {args.sparsities[completed_prune_times]}"):
+
+                    logger.info(f"Num prune samples total = {args.num_prune_samples}")
+                    logger.info(f"Prune batch size per device = {args.per_device_prune_batch_size}")
+
+                    sparsity = args.sparsities[completed_prune_times]
+                    with StateStdout(logger=logger, begin=f"Pruning to sparsity {sparsity}"):
                         for prune_batch in tqdm(prune_dataloader, desc="Pruning", disable=not accelerator.is_local_main_process):
                             sequential_model.forward(
-                                batch, prune=True,
+                                prune_batch, prune=True,
                                 min_layer=args.min_layer,
                                 max_layer=args.max_layer,
                                 prune_only=args.prune_only,
-                                sparsity=args.sparsities[completed_prune_times],
+                                sparsity=sparsity,
                                 prunen=args.prunen,
                                 prunem=args.prunem,
                                 percdamp=args.percdamp
                             )
 
+                    completed_prune_times += 1
                     del prune_data, prune_dataloader
+
+                    # Eval after pruning
+                    with StateStdout(logger=logger, begin=f"Eval after pruning"):
+                        sequential_eval(
+                            sequential_model,
+                            val_data, eval_dataloader, accelerator,
+                            hard_sparse_weight=args.gmp, sparse_ratio=sparsity
+                        )
 
                 # Schedule lr
                 lr = args.learning_rate * lr_schedule()
-                sequential_model.forward(batch, lr=lr)
+                # Loss yeild by each layer forwarding on this batch
+                layer_loss_batch, layer_similarity_batch = sequential_model.forward(batch, lr=lr)
+                for i, (loss, sim) in enumerate(zip(layer_loss_batch, layer_similarity_batch)):
+                    layer_losses[i] += loss / len(train_dataloader)
+                    layer_similarities[i] += sim / len(train_dataloader)
+                
+                # Show loss when a specified time arrival
+                if step % (10 * args.gradient_accumulation_steps) == 0:
+                    for i, (loss, sim) in enumerate(zip(layer_loss_batch, layer_similarity_batch)):
+                        logger.info(f"layer {i}\t loss {loss}\t similarity {sim}")
 
                 if (step + 1) % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                     completed_step += 1
                     progress_bar.update(1)
-                    # TODO: apply mask
                 
                 # Eval when meeting a specified step
                 if (step + 1) % (100 * args.gradient_accumulation_steps) == 0:
                     with StateStdout(logger=logger, begin=f"Eval in step{step + 1}"):
-                        sequential_eval(
+                        ppl = sequential_eval(
                             sequential_model,
-                            val_data, eval_dataloader, accelerator,
-                            hard_sparse_weight=args.gmp, sparse_ratio=args.sparsity
+                            val_data, eval_dataloader, accelerator, verbose=False,
+                            hard_sparse_weight=args.gmp, sparse_ratio=(sparsity if completed_prune_times else 0.)
                         )
+                        logger.info(f"Epoch {epoch + 1}\t Step {step + 1}\t Perplexity {ppl}\n")
+
+            # Show epoch loss of each layer
+            logger.info(f"[Epoch{epoch + 1} Losses]")
+            for i, loss in enumerate(layer_losses):
+                logger.info(f"layer {i}\t loss {loss}")
+            logger.info(f"\n[Epoch {epoch + 1} Similarities]")
+            for j, sim in enumerate(layer_similarities):
+                logger.info(f"layer {i}\t similarity {sim}")
+            logger.info("\n")
 
             # Eval when a epoch done
             with StateStdout(logger=logger, begin=f"Eval in epoch{epoch + 1}"):
-                sequential_eval(
+                ppl = sequential_eval(
                     sequential_model,
-                    val_data, eval_dataloader, accelerator,
-                    hard_sparse_weight=args.gmp, sparse_ratio=args.sparsity
+                    val_data, eval_dataloader, accelerator, verbose=False,
+                    hard_sparse_weight=args.gmp, sparse_ratio=(sparsity if completed_prune_times else 0.)
                 )
+                logger.info(f"Epoch {epoch + 1}\t Perplexity {ppl}\n")
+        
+        if not args.debug:
+            accelerator.wait_for_everyone()
+            model.save_pretrained(
+                args.output_dir,
+                is_main_process=accelerator.is_main_process,
+                save_function=accelerator.save
+            )
+            if accelerator.is_main_process:
+                tokenizer.save_pretrained(args.output_dir)
+
+    # Releases all references to the internal objects stored and call the garbage collector.
+    accelerator.clear()

@@ -45,9 +45,7 @@ class SparseGPT:
         inp = math.sqrt(2 / self.nsamples) * inp.float()
         self.H += inp.matmul(inp.t())
 
-    def fasterprune(
-        self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01
-    ):
+    def fasterprune(self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01):
         W = self.layer.weight.data.clone()
         if isinstance(self.layer, nn.Conv2d):
             W = W.flatten(1)

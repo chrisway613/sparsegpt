@@ -1,3 +1,6 @@
+import os
+import gc
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,6 +13,10 @@ from sparsegpt import SparseGPT
 from modelutils import find_layers
 
 
+torch.backends.cudnn.enabled = True
+torch.backends.cudnn.benchmark = True 
+
+
 class Catcher(nn.Module):
     def __init__(self, module, cache, states):
         super().__init__()
@@ -20,8 +27,8 @@ class Catcher(nn.Module):
 
     def forward(self, x, **kwargs):
         self.states[self.cache['layer_i']] = x
-
         self.cache['layer_i'] += 1
+        # self.states.data = x.data
         self.cache['attention_mask'] = kwargs['attention_mask']
         self.cache['alibi'] = kwargs['alibi']
 
@@ -37,9 +44,6 @@ class SequentialForward:
         self.accelerator = accelerator
         self.logger = logger or get_logger("Sequential")
 
-        # Output hidden states of each BloomBlock
-        self.teacher_out_hs = [None] * len(self.model.transformer.h)
-
     def train(self, batch, lr=0., prune=False, **kwargs):
         raise NotImplementedError
 
@@ -48,12 +52,17 @@ class SequentialForward:
         raise NotImplementedError
 
     def forward(self, batch, lr=0., train=True, prune=False, **kwargs):
-        self.train(batch, lr=lr, prune=prune, **kwargs) if train else self.eval(batch, **kwargs)
+        return self.train(batch, lr=lr, prune=prune, **kwargs) if train else self.eval(batch, **kwargs)
 
 
-class BloomSequential(SequentialForward):
-    def __init__(self, model, accelerator, logger=None):
+class SparseBloomSequential(SequentialForward):
+    def __init__(self, model, accelerator, logger=None, dense_dir=None, sparse_thresh=1e-10):
         super().__init__(model, accelerator, logger=logger)
+
+        # Path to dense weights
+        self.dense_dir = dense_dir
+        self.sparse_mask = {}
+        self.sparse_thresh = sparse_thresh
         
         # Only train BloomBlocks
         self.model.transformer.word_embeddings.requires_grad_(False)
@@ -61,7 +70,7 @@ class BloomSequential(SequentialForward):
         self.model.transformer.ln_f.requires_grad_(False)
         self.model.lm_head.requires_grad_(False)
 
-    def train(self, batch, lr=0., prune=False, **prune_kwargs):
+    def train(self, batch, lr=0., grad_scale=1., prune=False, **prune_kwargs):
         self.model.train()
 
         use_cache = self.model.config.use_cache
@@ -73,22 +82,21 @@ class BloomSequential(SequentialForward):
         ''' CPU -> GPU '''
 
         # Embedding layer & the 1st Layer Norm
-        self.model.transformer.word_embeddings.to(self.dev)
-        self.model.transformer.word_embeddings_layernorm.to(self.dev)
+        self.model.transformer.word_embeddings = self.accelerator.prepare(self.model.transformer.word_embeddings)
+        self.model.transformer.word_embeddings_layernorm = self.accelerator.prepare(self.model.transformer.word_embeddings_layernorm)
         # The 1st BloomBlock
-        layers[0] = layers[0].to(self.dev)
+        layers[0] = self.accelerator.prepare(layers[0])
 
         dtype = next(iter(self.model.parameters())).dtype
         hidden_size = self.model.config.hidden_size
-        # seq_length = next(iter(dataloader))['input_ids'].size(1)
-        # num_samples = dataloader.batch_size * len(dataloader)
         num_samples, seq_length = batch['input_ids'].shape[:2]
 
         # 记录每个样本在输入 BloomBlock 前的 hidden state
         in_hs = torch.zeros(
             (num_samples, seq_length, hidden_size),
-            dtype=dtype, device=self.dev
+            dtype=dtype, device=('cpu' if prune else self.dev)
         )
+
         # 记录当前 forward 到第几个 BloomBlock 以及对应的一些状态
         cache = {'layer_i': 0, 'attention_mask': None, 'alibi': None}
         # 以下会仅经过了：Embedding 层 -> LayerNorm -> the 1st BloomBlock
@@ -97,54 +105,66 @@ class BloomSequential(SequentialForward):
         # BloomBlock 前的部分(Embedding 层)不需要梯度
         with torch.no_grad():
             for i in range(num_samples):
-                sample = {k: v[i].unsqueeze(0) for k, v in batch.items()}
+                sample = {k: v[i].unsqueeze(0).to(self.dev) for k, v in batch.items()}
                 try:
                     self.model(**sample)
                 except ValueError:
                     pass
 
-        layers[0] = layers[0].module.cpu()
-        self.model.transformer.word_embeddings.cpu()
-        self.model.transformer.word_embeddings_layernorm.cpu()
-        
-        torch.cuda.empty_cache()
+        in_hs = in_hs.to('cpu')
+        layers[0] = self.accelerator.unwrap_model(layers[0].module).to('cpu')
+        self.model.transformer.word_embeddings = self.accelerator.unwrap_model(
+            self.model.transformer.word_embeddings
+        ).to('cpu')
+        self.model.transformer.word_embeddings_layernorm = self.accelerator.unwrap_model(
+            self.model.transformer.word_embeddings_layernorm
+        ).to('cpu')
+        self.accelerator.clear()
 
         # 记录每个样本经过 BloomBlock 输出后的 hidden states
-        # out_hs = torch.zeros_like(in_hs)
         alibi = cache['alibi']
         attention_mask = cache['attention_mask']
 
+        if not os.path.exists(self.dense_dir):
+            raise RuntimeError(f"Path to dense weights '{self.dense_dir}' not existed.")
+
+        # Cosine similarity between hidden states of sparse & dense
+        similarities = []
+        # Loss yeild by each layer
+        layer_losses = []
+
+        if prune:
+            sparsity = prune_kwargs.pop('sparsity')
+            min_layer = prune_kwargs.pop('min_layer', 0)
+            max_layer = prune_kwargs.pop('max_layer', 1000)
+            prune_only = prune_kwargs.pop('prune_only', '')
+
         for i in range(len(layers)):
             layer = layers[i]
+
+            # Load dense weights
             teacher_layer = deepcopy(layer)
-
-            layer_state_dict = torch.load(f'layer_{i}', map_location='cpu')
+            layer_state_dict = torch.load(os.path.join(self.dense_dir, f'layer_{i}'), map_location='cpu')
             teacher_layer.load_state_dict(layer_state_dict)
-            teacher_layer.to(self.dev)
+            teacher_layer = self.accelerator.prepare(teacher_layer)
+            teacher_layer.eval()
 
-            teacher_out_hs = teacher_layer(in_hs, attention_mask=attention_mask, alibi=alibi).cpu()
-            teacher_layer.to('cpu')
-            torch.cuda.empty_cache()
+            # Output hidden states of teacher, this will be regarded as the input hidden states for next layer
+            teacher_out_hs = torch.zeros_like(in_hs)
+            with torch.no_grad():
+                for j in range(num_samples):
+                    # NOTE: [0] means extracting hidden states from the output tuple
+                    teacher_out_hs[j] = teacher_layer(in_hs[j].unsqueeze(0).to(self.dev), attention_mask=attention_mask, alibi=alibi)[0]
+            del teacher_layer
+            self.accelerator.clear()
 
-            # Collect teacher's output hidden states if not existed
-            # if self.teacher_out_hs[i] is None:
-            #     self.teacher_out_hs[i] = torch.zeros_like(in_hs, device='cpu')
-            #     # 记录每个样本经过当前 BloomBlock 输出后的 hidden state
-            #     # for j in range(num_samples):
-            #     #     self.teacher_out_hs[j] = layer(
-            #     #         in_hs[j].unsqueeze(0),
-            #     #         attention_mask=attention_mask, alibi=alibi
-            #     #     )[0].cpu()
-            #     self.teacher_out_hs[i] = layer(in_hs, attention_mask=attention_mask, alibi=alibi).cpu()
+            layer = self.accelerator.prepare(layer)
+            unwrapped_layer = self.accelerator.unwrap_model(layer)
 
             # Pruning
-            if prune:                
+            if prune:
                 # 返回一个字典，找出当前 BloomBlock 下的所有 Linear 层
-                subset = find_layers(layer)
-
-                min_layer = prune_kwargs.pop('min_layer', 0)
-                max_layer = prune_kwargs.pop('max_layer', 1000)
-                prune_only = prune_kwargs.pop('prune_only', '')
+                subset = find_layers(unwrapped_layer)
 
                 gpts = {}
                 for name in subset:
@@ -164,9 +184,8 @@ class BloomSequential(SequentialForward):
                 # 其实这里的目的并非记录每个样本经过当前 BloomBlock 输出后的 hidden state
                 # (真正的记录过程在后面)
                 # 而是为了 SparseGPT() 做 add_batch()，让前面的注册的 hook 发挥作用
-                # for j in range(num_samples):
-                #     layer(in_hs[j].unsqueeze(0), attention_mask=attention_mask, alibi=alibi)
-                layer(in_hs, attention_mask=attention_mask, alibi=alibi)
+                for j in range(num_samples):
+                    unwrapped_layer(in_hs[j].unsqueeze(0).to(self.dev), attention_mask=attention_mask, alibi=alibi)
                 for h in handles:
                     h.remove()
 
@@ -174,36 +193,78 @@ class BloomSequential(SequentialForward):
                 self.logger.info(f"Pruning layer{i}..")
                 for name in gpts:
                     self.logger.info(f"Module: {name}")
-                    sparsity = prune_kwargs.pop('sparsity')
                     gpts[name].fasterprune(sparsity, **prune_kwargs)
+                    # Binary sparse mask (0|1)
+                    self.sparse_mask[name] = (subset[name].weight.abs() > self.sparse_thresh).to(dtype=dtype, device='cpu')
                 self.logger.info("Done!\n")
                 del gpts
             # Align with teacher
             else:
-                optimizer = torch.optim.AdamW(layer.parameters(), lr=lr)
+                optimizer = self.accelerator.prepare(torch.optim.AdamW(unwrapped_layer.parameters(), lr=lr))
+                optimizer.zero_grad(set_to_none=True)
 
-                # 记录每个样本经过当前 BloomBlock 输出后的 hidden state
-                out_hs = layer(in_hs, attention_mask=attention_mask, alibi=alibi)
-                loss = F.mse_loss(out_hs, self.teacher_out_hs[i].to(out_hs.device))
-                loss.backward()
+                out_hs = torch.zeros_like(in_hs, device=self.dev)
+                for j in range(num_samples):
+                    # NOTE: [0] means extracting hidden states from the output tuple
+                    out_hs[j] = layer(in_hs[j].unsqueeze(0).to(self.dev), attention_mask=attention_mask, alibi=alibi)[0]
+                var = out_hs.pow(2).mean(dim=-1, keepdim=True)
+
+                teacher_out_hs = teacher_out_hs.to(device=self.dev)
+                teacher_var = teacher_out_hs.pow(2).mean(dim=-1, keepdim=True)
+
+                # 每一层在每个 batch 上的 loss
+                # 在算 loss 前做 layernorm 方式的归一化
+                loss = F.mse_loss(
+                    out_hs / (var + 1e-6),
+                    teacher_out_hs / (teacher_var + 1e-6)
+                )
+                # TODO: be careful here!
+                self.accelerator.backward(loss / grad_scale)
+                layer_losses.append(loss.item())
+                del loss, var, teacher_var
+
+                with torch.no_grad():
+                    # TODO: be careful here!
+                    # Cosine similarity between sparse & dense
+                    sim = F.cosine_similarity(
+                        out_hs.reshape(-1, hidden_size),
+                        teacher_out_hs.reshape(-1, hidden_size)
+                    ).mean()
+                
+                del out_hs
+                # Reduce across all process
+                sim = (self.accelerator.reduce(sim) / self.accelerator.num_processes).item()
+                similarities.append(sim)
 
                 # Update parameters
                 optimizer.step()
-                optimizer.zero_grad()
-
-                del out_hs
+                # TODO: be careful here!
+                optimizer.zero_grad(set_to_none=True)
                 del optimizer
 
-            layers[i] = layer.cpu()
-            del layer
-            torch.cuda.empty_cache()
+                # Apply mask
+                if self.sparse_mask:
+                    subset = find_layers(unwrapped_layer)
+                    for name, module in subset.items():
+                        mask = self.sparse_mask[name].to(module.weight.device)
+                        module.weight.data = module.weight.data * mask
 
-            in_hs = self.teacher_out_hs[i].to(in_hs.device)
+            layers[i] = unwrapped_layer.to('cpu')
+            del layer
+
+            # Cut out the relationship between layers
+            in_hs = teacher_out_hs.detach().cpu()
+            del teacher_out_hs
+
+            self.accelerator.clear()
 
         del in_hs
         torch.cuda.empty_cache()
+        gc.collect()
 
         self.model.config.use_cache = use_cache
+
+        return layer_losses, similarities
 
     @torch.no_grad()
     def eval(self, batch, hard_sparse_weight=False, sparse_ratio=0.):
@@ -218,15 +279,13 @@ class BloomSequential(SequentialForward):
         ''' CPU -> GPU '''
 
         # Embedding layer & the 1st Layer Norm
-        self.model.transformer.word_embeddings.to(self.dev)
-        self.model.transformer.word_embeddings_layernorm.to(self.dev)
+        self.model.transformer.word_embeddings = self.accelerator.prepare(self.model.transformer.word_embeddings)
+        self.model.transformer.word_embeddings_layernorm = self.accelerator.prepare(self.model.transformer.word_embeddings_layernorm)
         # The 1st BloomBlock
-        layers[0] = layers[0].to(self.dev)
+        layers[0] = self.accelerator.prepare(layers[0])
 
         dtype = next(iter(self.model.parameters())).dtype
         hidden_size = self.model.config.hidden_size
-        # seq_length = next(iter(dataloader))['input_ids'].size(1)
-        # num_samples = dataloader.batch_size * len(dataloader)
         num_samples, seq_length = batch['input_ids'].shape[:2]
 
         # 记录每个样本在输入 BloomBlock 前的 hidden state
@@ -234,6 +293,7 @@ class BloomSequential(SequentialForward):
             (num_samples, seq_length, hidden_size),
             dtype=dtype, device=self.dev
         )
+
         # 记录当前 forward 到第几个 BloomBlock 以及对应的一些状态
         cache = {'layer_i': 0, 'attention_mask': None, 'alibi': None}
         # 以下会仅经过了：Embedding 层 -> LayerNorm -> the 1st BloomBlock
@@ -246,18 +306,20 @@ class BloomSequential(SequentialForward):
             except ValueError:
                 pass
 
-        layers[0] = layers[0].module.cpu()
-        self.model.transformer.word_embeddings.cpu()
-        self.model.transformer.word_embeddings_layernorm.cpu()
-        
-        torch.cuda.empty_cache()
+        layers[0] = self.accelerator.unwrap_model(layers[0].module).to('cpu')
+        self.model.transformer.word_embeddings = self.accelerator.unwrap_model(
+            self.model.transformer.word_embeddings
+        ).to('cpu')
+        self.model.transformer.word_embeddings_layernorm = self.accelerator.unwrap_model(
+            self.model.transformer.word_embeddings_layernorm
+        ).to('cpu')
+        self.accelerator.clear()
 
         alibi = cache['alibi']
         attention_mask = cache['attention_mask']
 
         for i in range(len(layers)):
-            layer = layers[i].to(self.dev)
-
+            layer = self.accelerator.prepare(layers[i])
             # 将稀疏的部分置0
             if hard_sparse_weight:
                 subset = find_layers(layer)
@@ -267,27 +329,34 @@ class BloomSequential(SequentialForward):
                     thresh = torch.sort(torch.abs(W.flatten()))[0][int(W.numel() * sparse_ratio)]
                     W.data[torch.abs(W.data) <= thresh] = 0
 
-            in_hs = layer(in_hs, attention_mask=attention_mask, alibi=alibi)
-            layers[i] = layer.cpu()
+            for j in range(num_samples):
+                # 每个 BloomBlock 的输出是元组，取第一个代表 hidden states
+                in_hs[j] = layer(in_hs[j].unsqueeze(0), attention_mask=attention_mask, alibi=alibi)[0]
 
+            layers[i] = self.accelerator.unwrap_model(layer).to('cpu')
             del layer
-            torch.cuda.empty_cache()
+            self.accelerator.clear()
         
-        self.model.transformer.ln_f.to(self.dev)
-        self.model.lm_head.to(self.dev)
-
-        logits = self.model.lm_head(self.model.transformer.ln_f(in_hs))
-        shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = batch['labels'][..., 1:].contiguous().to(shift_logits.device)
+        self.model.transformer.ln_f = self.accelerator.prepare(self.model.transformer.ln_f)
+        self.model.lm_head = self.accelerator.prepare(self.model.lm_head)
 
         loss_fct = nn.CrossEntropyLoss()
-        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
-        del logits, shift_logits, shift_labels
-        self.model.transformer.ln_f.to('cpu')
-        self.model.lm_head.to('cpu')
+        loss = 0.
+        for k in range(num_samples):
+            # Cast to float32 for better performance
+            logits = self.model.lm_head(self.model.transformer.ln_f(in_hs[k].unsqueeze(0))).to(torch.float32)
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = batch['labels'][k][..., 1:].contiguous().to(shift_logits.device)
 
-        torch.cuda.empty_cache()
+            loss_per_sample = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            loss = loss + loss_per_sample / num_samples
+        del logits, shift_logits, shift_labels, loss_per_sample, in_hs
+
+        self.model.transformer.ln_f = self.accelerator.unwrap_model(self.model.transformer.ln_f).to('cpu')
+        self.model.lm_head = self.accelerator.unwrap_model(self.model.lm_head).to('cpu')
+        self.accelerator.clear()
+
         self.model.config.use_cache = use_cache
 
         return loss
