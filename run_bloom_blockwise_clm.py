@@ -25,7 +25,7 @@ from accelerate.utils import set_seed
 from accelerate.logging import get_logger
 from accelerate import Accelerator, InitProcessGroupKwargs
 
-from transformers import default_data_collator
+from transformers import default_data_collator, SchedulerType, get_scheduler
 from transformers.models.bloom import BloomConfig, BloomTokenizerFast, BloomForCausalLM
 
 from sparsegpt import SparseGPT
@@ -160,17 +160,17 @@ def sequential_eval(
         # Used for all layers
         alibi = cache.pop('alibi')
         attention_mask = cache.pop('attention_mask')
-
         del cache
-        accelerator.clear()
+
+        accelerator._models.clear()
 
         # Sequential forwarding
         for i in range(len(layers)):
             # CPU -> GPU
-            layer = accelerator.prepare(layers[i])
+            layers[i] = accelerator.prepare(layers[i])
             # 将稀疏的部分置 0
             if hard_sparse_weight:
-                subset = find_layers(layer)
+                subset = find_layers(accelerator.unwrap_model(layers[i]))
                 for name in subset:
                     W = subset[name].weight.data
                     # 例如稀疏率是75%，那么先有小到大排序，然后将前 75% 的参数值置0
@@ -178,35 +178,39 @@ def sequential_eval(
                     W.data[torch.abs(W.data) <= thresh] = 0
 
             # Regard output hidden states as the input hidden states of next layer
-            hs = layer(hs, attention_mask=attention_mask, alibi=alibi)[0]
+            hs = layers[i](hs, attention_mask=attention_mask, alibi=alibi)[0]
 
             # GPU -> CPU
-            layers[i] = accelerator.unwrap_model(layer).cpu()
-            del layer
-            accelerator.clear()
+            layers[i] = accelerator.unwrap_model(layers[i]).cpu()
+
+            accelerator._models.clear()
         
         # CPU -> GPU
         model.transformer.ln_f = ln_f = accelerator.prepare(ln_f)
         model.lm_head = lm_head = accelerator.prepare(lm_head)
 
-        # Force to fp32 for stability
-        logits = lm_head(ln_f(hs)).to(torch.float32)
-        # Current token predict the next one
-        shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = batch['labels'][..., 1:].contiguous()
-
-        # Loss
-        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-        del logits, shift_logits, shift_labels
+        batch_loss = []
+        for hs_sample, label in zip(hs, batch['labels']):
+            # Force to fp32 for stability
+            logits = lm_head(ln_f(hs_sample.unsqueeze(0))).to(torch.float32)
+            # Current token predict the next one
+            logits = logits[:, :-1, :].contiguous()
+            shift_labels = label.unsqueeze(0)[..., 1:].contiguous()
+            
+            # Loss
+            loss = loss_fct(logits.view(-1, logits.size(-1)), shift_labels.view(-1))
+            batch_loss.append(loss)
+            del logits, shift_labels, loss
 
         # GPU -> CPU
         model.transformer.ln_f = ln_f = accelerator.unwrap_model(ln_f).cpu()
         model.lm_head = lm_head = accelerator.unwrap_model(lm_head).cpu()
-        # (num_devices*batch_size,)
-        losses.append(accelerator.gather(loss.repeat(batch_size)).cpu())
 
-        del loss
-        accelerator.clear()
+        # (num_devices*batch_size,)
+        losses.append(accelerator.gather(torch.stack(batch_loss)))
+        del batch_loss
+
+        accelerator._models.clear()
 
     losses = torch.cat(losses)
     losses = losses[:len(dataset)]
@@ -215,9 +219,12 @@ def sequential_eval(
     except OverflowError:
         perplexity = float("inf")
     
-    del losses
     if verbose:
         logger.info(f"Perplexity: {perplexity}\n")
+    
+    del losses
+    gc.collect()
+    torch.cuda.empty_cache()
 
     model.config.use_cache = use_cache
     model.train(mode=mode)
@@ -362,6 +369,20 @@ def parse_args():
         type=int,
         default=0,
         help="Number of steps for the warmup training."
+    )
+    parser.add_argument(
+        "--optimizer_type",
+        type=str,
+        default='adamw',
+        help="Type of optimizer."
+    )
+    parser.add_argument(
+        "--lr_scheduler_type",
+        type=SchedulerType,
+        default="linear",
+        help="The scheduler type to use.",
+        choices=["linear", "cosine", "cosine_with_restarts",
+                 "polynomial", "constant", "constant_with_warmup"]
     )
 
     # Prune
@@ -674,10 +695,10 @@ if __name__ == '__main__':
     # Train(& Prune)
     else:
         # Customize learning rate scheduler
-        def lr_schedule(step):
-            if step < args.num_warmup_steps:
-                return float(step) / float(max(1, args.num_warmup_steps))
-            return max(0.0, float(total_steps - step)) / float(max(1, total_steps - args.num_warmup_steps))
+        # def lr_schedule(step):
+        #     if step < args.num_warmup_steps:
+        #         return float(step) / float(max(1, args.num_warmup_steps))
+        #     return max(0.0, float(total_steps - step)) / float(max(1, total_steps - args.num_warmup_steps))
 
         # NOTE: We only train BloomBlocks
         model.transformer.word_embeddings.requires_grad_(False)
@@ -716,14 +737,14 @@ if __name__ == '__main__':
 
         # Block-wise forwarding, i.e. 
         # It is turn to the next block only after the previous block done with all batches
-        for layer_i, layer in enumerate(layers):
+        for layer_i in range(len(layers)):
             # CPU -> GPU
-            layer = layers[layer_i] = accelerator.prepare(layer)
-            unwrapped_layer = accelerator.unwrap_model(layer)
+            layers[layer_i] = accelerator.prepare(layers[layer_i])
+            unwrapped_layer = accelerator.unwrap_model(layers[layer_i])
 
             msg = "Collecting output hidden states from teacher .."
             with StateStdout(logger=logger, begin=msg):
-                layer.eval()
+                layers[layer_i].eval()
 
                 with torch.no_grad():
                     out_batches.clear()
@@ -747,7 +768,7 @@ if __name__ == '__main__':
                             cache = {'attention_mask': None, 'alibi': None}
                             # 以下会仅经过了：Embedding 层 -> LayerNorm -> the 1st BloomBlock
                             # 从而将每个样本在输入第一个 BloomBlock 前的 hidden state 记录下来
-                            layers[layer_i] = layer = BatchCatcher(layer, cache, hs)
+                            layers[0] = BatchCatcher(layers[0], cache, hs)
                             # BloomBlock 前的部分(Embedding 层)不需要梯度
                             with torch.no_grad():
                                 try:
@@ -763,7 +784,7 @@ if __name__ == '__main__':
                             attention_mask_batches.append(cache.pop('attention_mask').cpu())
 
                             # Extract layer from BatchCacher
-                            layers[layer_i] = layer = layer.module
+                            layers[0] = layers[0].module
                             
                             ''' GPU -> CPU '''
 
@@ -782,7 +803,7 @@ if __name__ == '__main__':
                         attention_mask = attention_mask_batches[batch_i].to(dev)
 
                         # [BE CAREFUL] detach and thus cut out the relationship between layers
-                        out = layer(hs, attention_mask=attention_mask, alibi=alibi)[0].detach().cpu()
+                        out = layers[layer_i](hs, attention_mask=attention_mask, alibi=alibi)[0].detach().cpu()
                         out_batches.append(out)
 
                         ''' CPU -> GPU '''
@@ -799,7 +820,7 @@ if __name__ == '__main__':
                         gc.collect()
                         torch.cuda.empty_cache()
             
-                layer.train()
+                layers[layer_i].train()
 
             # NOTE: here, step means number of epochs
             completed_step = 0
@@ -813,7 +834,22 @@ if __name__ == '__main__':
             lr = args.learning_rate
 
             # Optimizer
-            optimizer = accelerator.prepare(torch.optim.AdamW(unwrapped_layer.parameters(), lr=lr))
+            if args.optimizer_type == 'adamw':
+                optimizer = torch.optim.AdamW(unwrapped_layer.parameters(), lr=lr)
+            elif args.optimizer_type == 'sgd':
+                optimizer = torch.optim.SGD(unwrapped_layer.parameters(), lr)
+            else:
+                raise NotImplementedError(f"Got not supported optimizer: {args.optimizer_type}.")
+
+            # Lr scheduler
+            lr_scheduler = get_scheduler(
+                name=args.lr_scheduler_type,
+                optimizer=optimizer,
+                num_warmup_steps=args.num_warmup_steps,
+                num_training_steps=args.num_train_epochs
+            )
+            
+            optimizer, lr_scheduler = accelerator.prepare(optimizer, lr_scheduler)
             # NOTE: Set initial gradients to None can save some memories
             optimizer.zero_grad(set_to_none=True)
 
@@ -829,10 +865,11 @@ if __name__ == '__main__':
                     num_prune_batches = min(args.num_prune_samples // hs_batches[0].size(0), len(hs_batches))
                     prune_batch_indices = random.sample(range(len(hs_batches)), num_prune_batches)
                     
+                    # NOTE: .clone(): make a copy of training data to prevent influences
                     # (num_prune_batches * train_batch_size, seq_length, hidden_size)
-                    prune_hidden_states = torch.cat([hs_batches[batch_i] for batch_i in prune_batch_indices])
-                    prune_alibis = torch.cat([alibi_batches[batch_i] for batch_i in prune_batch_indices])
-                    prune_attention_masks = torch.cat([attention_mask_batches[batch_i] for batch_i in prune_batch_indices])
+                    prune_hidden_states = torch.cat([hs_batches[batch_i].clone() for batch_i in prune_batch_indices])
+                    prune_alibis = torch.cat([alibi_batches[batch_i].clone() for batch_i in prune_batch_indices])
+                    prune_attention_masks = torch.cat([attention_mask_batches[batch_i].clone() for batch_i in prune_batch_indices])
                     logger.info(f"{prune_hidden_states.size(0)} pruning samples selected.")
 
                     with StateStdout(logger=logger, begin=f"Pruning layer {layer_i + 1} to sparsity {sparsity} .."):
@@ -856,8 +893,9 @@ if __name__ == '__main__':
 
                         # NOTE: 'sequential_eval()' will Release all memories,
                         # so we should put layer back to proper device
-                        layer = layers[layer_i] = accelerator.prepare(layers[layer_i])
-                        unwrapped_layer = accelerator.unwrap_model(layer)
+                        if isinstance(layers[layer_i], nn.Module):
+                            layers[layer_i] = accelerator.prepare(layers[layer_i])
+                            unwrapped_layer = accelerator.unwrap_model(layers[layer_i])
 
                         if ppl <= args.dense_metric:
                             logger.info(f"NOTE: The perplexity({ppl}) is better than dense's({args.dense_metric}), skip training for this layer.\n")
@@ -880,7 +918,7 @@ if __name__ == '__main__':
                     ''' Align with teacher '''
 
                     # Forward
-                    out = layer(hs, attention_mask=attention_mask, alibi=alibi)[0]
+                    out = layers[layer_i](hs, attention_mask=attention_mask, alibi=alibi)[0]
 
                     ''' CPU -> GPU '''
 
@@ -937,10 +975,15 @@ if __name__ == '__main__':
 
                 # Epoch counted
                 completed_step += 1
+
                 # Update lr
-                next_lr = args.learning_rate * lr_schedule(completed_step)
-                for group in optimizer.param_groups:
-                    group['lr'] = next_lr
+                # next_lr = args.learning_rate * lr_schedule(completed_step)
+                # for group in optimizer.param_groups:
+                #     group['lr'] = next_lr
+
+                # Update lr
+                lr_scheduler.step()
+                next_lr = lr_scheduler.get_last_lr()[0]
                 
                 # Apply sparse mask
                 if MASK:
@@ -960,12 +1003,13 @@ if __name__ == '__main__':
 
                     # NOTE: 'sequential_eval()' will Release all memories,
                     # so we should put layer back to proper device
-                    layer = layers[layer_i] = accelerator.prepare(layers[layer_i])
-                    unwrapped_layer = accelerator.unwrap_model(layer)
+                    if isinstance(layers[layer_i], nn.Module):
+                        layers[layer_i] = accelerator.prepare(layers[layer_i])
+                        unwrapped_layer = accelerator.unwrap_model(layers[layer_i])
                 
                 # Log training info when the epoch done
                 logger.info(
-                    f"Layer {layer_i + 1}\t Epoch {epoch + 1}\t lr {lr}\t next lr {next_lr}\n"
+                    f"[Layer {layer_i + 1}]\t Epoch {epoch + 1}\t lr {lr}\t next lr {next_lr}\n"
                     f"Loss {layer_loss}\t Similarity {layer_similarity}\t Perplexity {ppl}\n"
                 )
                 
@@ -991,7 +1035,7 @@ if __name__ == '__main__':
 
             # GPU -> CPU
             layers[layer_i] = unwrapped_layer.to('cpu')
-            del unwrapped_layer, layer, optimizer
+            del unwrapped_layer, optimizer, lr_scheduler
             # Releases all references to the internal objects stored and call the garbage collector
             accelerator.clear()
             
