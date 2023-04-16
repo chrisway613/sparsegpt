@@ -12,7 +12,6 @@ import torch.nn.functional as F
 import datasets
 import transformers
 
-from copy import deepcopy
 from tqdm.auto import tqdm
 from itertools import chain
 from datetime import timedelta
@@ -694,12 +693,6 @@ if __name__ == '__main__':
             sequential_eval(model, val_data, eval_dataloader, accelerator)
     # Train(& Prune)
     else:
-        # Customize learning rate scheduler
-        # def lr_schedule(step):
-        #     if step < args.num_warmup_steps:
-        #         return float(step) / float(max(1, args.num_warmup_steps))
-        #     return max(0.0, float(total_steps - step)) / float(max(1, total_steps - args.num_warmup_steps))
-
         # NOTE: We only train BloomBlocks
         model.transformer.word_embeddings.requires_grad_(False)
         model.transformer.word_embeddings_layernorm.requires_grad_(False)
@@ -897,10 +890,6 @@ if __name__ == '__main__':
                             layers[layer_i] = accelerator.prepare(layers[layer_i])
                             unwrapped_layer = accelerator.unwrap_model(layers[layer_i])
 
-                        if ppl <= args.dense_metric:
-                            logger.info(f"NOTE: The perplexity({ppl}) is better than dense's({args.dense_metric}), skip training for this layer.\n")
-                            break
-
                 # Loss among all data
                 layer_loss = 0.
                 # Cosine similarity(vs teacher) among all data
@@ -977,11 +966,6 @@ if __name__ == '__main__':
                 completed_step += 1
 
                 # Update lr
-                # next_lr = args.learning_rate * lr_schedule(completed_step)
-                # for group in optimizer.param_groups:
-                #     group['lr'] = next_lr
-
-                # Update lr
                 lr_scheduler.step()
                 next_lr = lr_scheduler.get_last_lr()[0]
                 
@@ -1021,9 +1005,6 @@ if __name__ == '__main__':
                 # Done if it is close enough to teacher
                 if layer_similarity > 0.998:
                     logger.info(f"NOTE: Similarity > 0.998, layer {layer_i + 1} is DONE!\n")
-                    break
-                if ppl <= args.dense_metric:
-                    logger.info(f"NOTE: The perplexity({ppl}) is better than dense's({args.dense_metric}), layer {layer_i + 1} is DONE!\n")
                     break
             
             # Clear sparse mask, cuz it is no use for next layer
