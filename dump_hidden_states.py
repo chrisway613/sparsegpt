@@ -207,6 +207,12 @@ def parse_args():
 
     # Model
     parser.add_argument(
+        "--model_name",
+        type=str,
+        required=True,
+        help="model identifier from huggingface.co/models, used for initial tokenizer."
+    )
+    parser.add_argument(
         "--model_name_or_path",
         type=str,
         required=True,
@@ -249,7 +255,7 @@ def parse_args():
     parser.add_argument(
         "--max_seq_length",
         type=int,
-        default=512,
+        default=256,
         help="Max sequence length of a data sample."
     )
     parser.add_argument(
@@ -320,7 +326,7 @@ if __name__ == '__main__':
         #     data['train'] = data['train'].select(train_indices)
 
     # Tokenize data texts
-    tokenizer = BloomTokenizerFast.from_pretrained(args.model_name_or_path, cache_dir=args.model_cache_dir)
+    tokenizer = BloomTokenizerFast.from_pretrained(args.model_name, cache_dir=args.model_cache_dir)
 
     column_names = data['train'].column_names
     text_column_name = "text" if "text" in column_names else column_names[0]
@@ -411,7 +417,7 @@ if __name__ == '__main__':
     dataloader = accelerator.prepare(dataloader)
 
     # Dump output hidden states of the target layer
-    dump_layer_output_hs(model, args.target_layer, dataloader, accelerator)
+    dump_layer_output_hs(model, args.target_layer, dataloader, accelerator, output_dir=args.output_dir)
 
     # Releases all references to the internal objects stored and call the garbage collector.
     accelerator.clear()

@@ -2,13 +2,15 @@
 
 LOG=${1}
 
-CUDA_VISIBLE_DEVICES=0,1 \
+CUDA_VISIBLE_DEVICES=3,4 \
 nohup accelerate launch dump_hidden_states.py \
-    --model_name_or_path bigscience/bloom-7b1 \
-    --model_cache_dir /ssd1/models/bloom \
+    --model_name bigscience/bloom \
+    --model_name_or_path /ssd6/xiangyangkan/models/huggingface-models/bloom-176b \
+    --model_cache_dir /ssd6/xiangyangkan/models/huggingface-models/bloom-176b \
     --dataset_name wikitext \
     --dataset_config_name wikitext-2-raw-v1 \
     --data_cache_dir /ssd1/datasets/wikitext \
     --per_device_batch_size 32 \
     --target_layer 59 \
+    --output_dir seq_len_256 \
     >> $LOG.log 2>&1 &
