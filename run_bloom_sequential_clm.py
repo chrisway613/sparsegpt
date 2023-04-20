@@ -48,11 +48,11 @@ class StateStdout:
         self.logger.info(f"{self.end}\n")
 
 
-def skip(*args, **kwargs):
+def disable_torch_init():
+
+    def skip(*args, **kwargs):
         pass
 
-
-def disable_torch_init():
     torch.nn.init.normal_ = skip
     torch.nn.init.uniform_ = skip
     torch.nn.init.kaiming_uniform_ = skip
@@ -539,11 +539,11 @@ if __name__ == '__main__':
                 # Show loss when a specified time arrival
                 if step % (10 * args.gradient_accumulation_steps) == 0:
                     for i, (loss, sim) in enumerate(zip(layer_loss_batch, layer_similarity_batch)):
-                        logger.info(f"layer {i}\t loss {loss}\t similarity {sim}")
+                        logger.info(f"layer {i}\t loss {loss}\t similarity {sim}\n")
 
                 if (step + 1) % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                     completed_step += 1
-                    progress_bar.update(1)
+                    progress_bar.update()
                 
                 # Eval when meeting a specified step
                 if (step + 1) % (100 * args.gradient_accumulation_steps) == 0:

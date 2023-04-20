@@ -4,8 +4,6 @@ import random
 import logging
 import argparse
 
-import numpy as np
-
 import torch
 import torch.nn as nn
 
@@ -103,7 +101,11 @@ def dump_layer_output_hs(
     dtype = next(iter(model.parameters())).dtype
     hidden_size = model.config.hidden_size
 
-    result = []
+    all_hs = []
+    all_alibi = []
+    all_labels = []
+    all_attn_mask = []
+
     for batch in tqdm(dataloader, desc="Collect batched output hidden states", disable=not accelerator.is_local_main_process):
         ''' CPU -> GPU '''
 
@@ -146,6 +148,9 @@ def dump_layer_output_hs(
         attention_mask = cache.pop('attention_mask')
         del cache
 
+        alibi_repeat_size = (batch_size,) + (1,) * (alibi.ndim - 1)
+        attn_mask_repeat_size = (batch_size,) + (1,) * (attention_mask.ndim - 1)
+
         # Sequential forwarding until the target layer
         for i in range(len(layers[:layer_i + 1])):
             # CPU -> GPU
@@ -164,8 +169,12 @@ def dump_layer_output_hs(
             for sample_i in range(batch_size):
                 # Regard output hidden states as the input hidden states of next layer
                 hs[sample_i] = layers[i](hs[sample_i].unsqueeze(0), attention_mask=attention_mask, alibi=alibi)[0]
+            
             # The results collected should be put to cpu in case of increasing gpu memory used
-            result.append(hs.cpu())
+            all_hs.append(hs.cpu())
+            all_labels.append(batch['labels'].cpu())
+            all_alibi.append(alibi.cpu().repeat(alibi_repeat_size))
+            all_attn_mask.append(attention_mask.cpu().repeat(attn_mask_repeat_size))
 
             # GPU -> CPU
             layers[i] = layers[i].cpu()
@@ -176,25 +185,45 @@ def dump_layer_output_hs(
     ''' Save results '''
 
     # (num_batches * batch_size, seq_length, hidden_size)
+    all_hs = torch.cat(all_hs)
+    all_alibi = torch.cat(all_alibi)
+    all_labels = torch.cat(all_labels)
+    all_attn_mask = torch.cat(all_attn_mask)
     # tensor -> array
-    result = torch.cat(result)
     # NOTE: Numpy array do not support bf16
-    if result.dtype == torch.bfloat16:
-        result = result.half()
-        logger.info("NOTE: numpy array do not support bf16, cast to fp16 instead.\n")
-    result = result.numpy()
+    # if all_hs.dtype == torch.bfloat16:
+    #     all_hs = all_hs.half()
+    #     logger.info("NOTE: numpy array do not support bf16, cast to fp16 instead.\n")
+    # all_hs = all_hs.numpy()
     
     output_dir = output_dir or f"rank{accelerator.process_index}"
     os.makedirs(output_dir, exist_ok=True)
 
-    file = os.path.join(output_dir, f"layer{layer_i}.npz")
-    np.savez(file, layer_outputs=result)
+    file_hs = os.path.join(output_dir, f"layer{layer_i}_hs")
+    file_alibi = os.path.join(output_dir, f"layer{layer_i}_alibi")
+    file_labels = os.path.join(output_dir, f"layer{layer_i}_labels")
+    file_attn_mask = os.path.join(output_dir, f"lauyer{layer_i}_attn_mask")
+
+    # np.savez(file, layer_outputs=all_hs)
+    torch.save(all_hs, file_hs)
     if verbose:
-        logger.info(f"NOTE: output hidden states of layer {i} has been saved to {file}.\n")
+        logger.info(f"NOTE: output hidden states of layer {i} has been saved to {file_hs}.\n")
+
+    torch.save(all_alibi, file_alibi)
+    if verbose:
+        logger.info(f"NOTE: input alibis of layer {i} has been saved to {file_alibi}.\n")
+
+    torch.save(all_labels, file_labels)
+    if verbose:
+        logger.info(f"NOTE: labels has been saved to {file_labels}.\n")
+
+    torch.save(all_attn_mask, file_attn_mask)
+    if verbose:
+        logger.info(f"NOTE: input attention masks of layer {i} has been saved to {file_attn_mask}.\n")
     
     ''' Release memories '''
 
-    del result
+    del all_hs, all_alibi, all_labels, all_attn_mask
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -314,16 +343,6 @@ if __name__ == '__main__':
             args.dataset_name, args.dataset_config_name,
             cache_dir=args.data_cache_dir, use_auth_token=True
         )
-        # TODO: transfer below to test data
-        # if 'validation' not in data:
-        #     # val : train = 5% : 95%
-        #     num_val_samples = int(0.05 * len(data['train']))
-        #     val_indices = random.sample(range(len(data['train'])), num_val_samples)
-        #     train_indices = [i for i in range(len(data['train'])) if i not in val_indices]
-        #     assert len(train_indices) + len(val_indices) == len(data['train'])
-
-        #     data['validation'] = data['train'].select(val_indices)
-        #     data['train'] = data['train'].select(train_indices)
 
     # Tokenize data texts
     tokenizer = BloomTokenizerFast.from_pretrained(args.model_name, cache_dir=args.model_cache_dir)

@@ -12,11 +12,17 @@ def set_seed(seed):
     torch.random.manual_seed(seed)
 
 
-def get_wikitext2(nsamples, seed, seqlen, model):
+def get_wikitext2(nsamples, seed, seqlen, model, tokenizer_cache_dir=None, data_cache_dir=None, test=False):
+    if test:
+        return get_wikitext2_testloader(
+            nsamples, seed, seqlen, model,
+            tokenizer_cache_dir=tokenizer_cache_dir, data_cache_dir=data_cache_dir
+        )
+    
     traindata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
     testdata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
 
-    tokenizer = AutoTokenizer.from_pretrained(model, use_fast=False)
+    tokenizer = AutoTokenizer.from_pretrained(model, cache_dir=tokenizer_cache_dir, use_fast=False)
 
     trainenc = tokenizer(" ".join(traindata['text']), return_tensors='pt')
     testenc = tokenizer("\n\n".join(testdata['text']), return_tensors='pt')
@@ -35,6 +41,35 @@ def get_wikitext2(nsamples, seed, seqlen, model):
         trainloader.append((inp, tar))
 
     return trainloader, testenc
+
+
+def get_wikitext2_testloader(nsamples, seed, seqlen, model, tokenizer_cache_dir=None, data_cache_dir=None):
+    random.seed(seed)
+
+    tokenizer = AutoTokenizer.from_pretrained(model, cache_dir=tokenizer_cache_dir)
+
+    testdata = load_dataset(
+        'wikitext', 'wikitext-2-raw-v1', split='test',
+        cache_dir=data_cache_dir, use_auth_token=True
+    )
+    testenc = tokenizer(" ".join(testdata['text']), return_tensors='pt')
+
+    i, testloader = 0, []
+    while True:
+        j = i + seqlen
+        if j > testenc.input_ids.size(1):
+            break
+
+        inp = testenc.input_ids[:, i:j]
+        tar = inp.clone()
+        tar[:, :-1] = -100
+        testloader.append((inp, tar))
+
+        i = j
+
+    print(f"Total {len(testloader)} samples.\n")
+    return testloader
+
 
 def get_ptb(nsamples, seed, seqlen, model):
     traindata = load_dataset('ptb_text_only', 'penn_treebank', split='train')
@@ -146,9 +181,13 @@ def get_wikipedia(nsamples, seed, seqlen, model, debug=False):
     return trainloader, testenc
 
 
-def get_loaders(name, nsamples=128, seed=42, seqlen=2048, model='', debug=False):
+def get_loaders(name, nsamples=128, seed=42, seqlen=2048, model='', tokenizer_cache_dir=None, data_cache_dir=None, debug=False, test=False):
     if 'wikitext2' in name:
-        return get_wikitext2(nsamples, seed, seqlen, model)
+        return get_wikitext2(
+            nsamples, seed, seqlen, model, 
+            tokenizer_cache_dir=tokenizer_cache_dir, 
+            data_cache_dir=data_cache_dir, test=test
+        )
     
     if 'ptb' in name:
         return get_ptb(nsamples, seed, seqlen, model)
