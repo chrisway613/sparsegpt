@@ -23,6 +23,8 @@ from accelerate import Accelerator, InitProcessGroupKwargs
 from transformers import default_data_collator
 from transformers.models.bloom import BloomConfig, BloomTokenizerFast, BloomForCausalLM
 
+from peft import LoraConfig, TaskType, get_peft_model
+
 from sequential import SequentialForward, SparseBloomSequential
 # from sequential_single_gpu_fp32 import SequentialForward, SparseBloomSequential
 # from sequential_single_gpu_amp import SequentialForward, SparseBloomSequential
@@ -92,6 +94,12 @@ def parse_args():
         help="Path to pretrained model or model identifier from huggingface.co/models."
     )
     parser.add_argument(
+        "--model_name",
+        type=str,
+        required=True,
+        help="Model identifier from huggingface.co/models."
+    )
+    parser.add_argument(
         "--model_cache_dir",
         type=str,
         default=None,
@@ -128,7 +136,7 @@ def parse_args():
     parser.add_argument(
         "--max_seq_length",
         type=int,
-        default=512,
+        default=256,
         help="Max sequence length of a data sample."
     )
     parser.add_argument(
@@ -161,6 +169,22 @@ def parse_args():
         default=0,
         help="Number of steps for the warmup training."
     )
+    parser.add_argument(
+        "--use_gradient_checkpointing",
+        action="store_true",
+        help="Whether to use gradient checkpointing, this is for memory efficiency."
+    )
+    parser.add_argument(
+        "--lora",
+        action="store_true",
+        help="Whether to use Low-Rank decomposition."
+    )
+    parser.add_argument(
+        "--lora_rank",
+        type=int,
+        default=32,
+        help="Lora attention dimension."
+    )
 
     # Prune
     parser.add_argument(
@@ -177,6 +201,12 @@ def parse_args():
         type=int,
         default=128,
         help="Batch size (per device) for the pruning dataloader.",
+    )
+    parser.add_argument(
+        "--pruner",
+        type=str,
+        default="sparsegpt",
+        help="Pruner type."
     )
     parser.add_argument(
         '--percdamp', type=float, default=.01,
@@ -321,7 +351,7 @@ if __name__ == '__main__':
             data['train'] = data['train'].select(train_indices)
 
     # Tokenize data texts
-    tokenizer = BloomTokenizerFast.from_pretrained(args.model_name_or_path, cache_dir=args.model_cache_dir)
+    tokenizer = BloomTokenizerFast.from_pretrained(args.model_name, cache_dir=args.model_cache_dir)
 
     column_names = data['train'].column_names
     text_column_name = "text" if "text" in column_names else column_names[0]
@@ -382,10 +412,14 @@ if __name__ == '__main__':
         train_data = data['train']
     if args.debug:
         train_data = data['train'].select(range(96))
-        # NOTE: debug=overfit
+        # NOTE: debug also means overfit
         val_data = train_data
         logger.info(f"NOTE: debug mode on! only 96 train(eval) data samples selected.\n")
-    
+    # TODO: remove future, just use test set for better performance currently
+    else:
+        train_data = data['test']
+        val_data = data['test']
+
     logger.info(f"\tNum validation data = {len(val_data)}")
     if not args.eval_only:
         logger.info(f"\tNum training data = {len(train_data)}")
@@ -414,7 +448,7 @@ if __name__ == '__main__':
     model = BloomForCausalLM.from_pretrained(
         args.model_name_or_path,
         config=model_config,
-        # torch_dtype='auto',
+        # torch_dtype=torch.bfloat16,
         cache_dir=args.model_cache_dir
     )
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
@@ -423,6 +457,15 @@ if __name__ == '__main__':
     if len(tokenizer) > embedding_size:
         model.resize_token_embeddings(len(tokenizer))
     logger.info(f"\nModel structure:\n{model}\n")
+
+    # Enable gradient checkpointing for memory efficiency
+    if args.use_gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+    # Enable lora
+    if args.lora:
+        lora_config = LoraConfig(task_type=TaskType.CAUSAL_LM, r=args.lora_rank, lora_alpha=args.lora_rank * 4)
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
 
     # Model that performs sequential forwarding
     sequential_model = SparseBloomSequential(model, accelerator, logger=logger, dense_dir=args.path_to_dense)
@@ -514,6 +557,7 @@ if __name__ == '__main__':
                                 sparsity=sparsity,
                                 prunen=args.prunen,
                                 prunem=args.prunem,
+                                pruner=args.pruner,
                                 percdamp=args.percdamp
                             )
 

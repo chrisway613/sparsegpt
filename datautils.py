@@ -66,9 +66,9 @@ def get_wikitext2_testloader(nsamples, seed, seqlen, model, tokenizer_cache_dir=
         testloader.append((inp, tar))
 
         i = j
-
     print(f"Total {len(testloader)} samples.\n")
-    return testloader
+
+    return testloader, testenc
 
 
 def get_ptb(nsamples, seed, seqlen, model):
@@ -181,7 +181,11 @@ def get_wikipedia(nsamples, seed, seqlen, model, debug=False):
     return trainloader, testenc
 
 
-def get_loaders(name, nsamples=128, seed=42, seqlen=2048, model='', tokenizer_cache_dir=None, data_cache_dir=None, debug=False, test=False):
+def get_loaders(
+    name, nsamples=128, seed=42, seqlen=2048, 
+    model='', tokenizer_cache_dir=None, 
+    data_cache_dir=None, debug=False, test=False
+):
     if 'wikitext2' in name:
         return get_wikitext2(
             nsamples, seed, seqlen, model, 
