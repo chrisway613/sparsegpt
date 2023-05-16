@@ -5,13 +5,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from tqdm import tqdm
 from copy import deepcopy
 
+from peft.tuners.lora import LoraLayer
 from accelerate.logging import get_logger
 
-from sparsegpt import SparseGPT
 from modelutils import find_layers
-
+from sparsegpt import SparseGPT, ABCSolver
 
 torch.backends.cudnn.enabled = True
 torch.backends.cudnn.benchmark = True 
@@ -94,8 +95,10 @@ class SparseBloomSequential(SequentialForward):
         # 记录每个样本在输入 BloomBlock 前的 hidden state
         in_hs = torch.zeros(
             (num_samples, seq_length, hidden_size),
-            dtype=dtype, device=('cpu' if prune else self.dev)
+            dtype=dtype, device='cpu'
         )
+        # NOTE: be careful that must use '.clone()' here for not changing the original one
+        teacher_in_hs = in_hs.detach().clone()
 
         # 记录当前 forward 到第几个 BloomBlock 以及对应的一些状态
         cache = {'layer_i': 0, 'attention_mask': None, 'alibi': None}
@@ -111,19 +114,20 @@ class SparseBloomSequential(SequentialForward):
                 except ValueError:
                     pass
 
-        in_hs = in_hs.to('cpu')
-        layers[0] = self.accelerator.unwrap_model(layers[0].module).to('cpu')
+        in_hs = in_hs.cpu()
+        layers[0] = self.accelerator.unwrap_model(layers[0].module).cpu()
         self.model.transformer.word_embeddings = self.accelerator.unwrap_model(
             self.model.transformer.word_embeddings
-        ).to('cpu')
+        ).cpu()
         self.model.transformer.word_embeddings_layernorm = self.accelerator.unwrap_model(
             self.model.transformer.word_embeddings_layernorm
-        ).to('cpu')
+        ).cpu()
         self.accelerator.clear()
 
         # 记录每个样本经过 BloomBlock 输出后的 hidden states
-        alibi = cache['alibi']
-        attention_mask = cache['attention_mask']
+        alibi = cache.pop('alibi')
+        attention_mask = cache.pop('attention_mask')
+        del cache
 
         if not os.path.exists(self.dense_dir):
             raise RuntimeError(f"Path to dense weights '{self.dense_dir}' not existed.")
@@ -138,25 +142,44 @@ class SparseBloomSequential(SequentialForward):
             min_layer = prune_kwargs.pop('min_layer', 0)
             max_layer = prune_kwargs.pop('max_layer', 1000)
             prune_only = prune_kwargs.pop('prune_only', '')
+            pruner = prune_kwargs.pop('pruner', 'sparsegpt')
 
-        for i in range(len(layers)):
+        for i in tqdm(range(len(layers)), desc="Layer-by-Layer Forward", disable=not self.accelerator.is_local_main_process):
             layer = layers[i]
 
             # Load dense weights
+            sd_file = f"pytorch_model_{(i + 2):0>5d}-of-00072.bin"
+            state_dict = torch.load(os.path.join(self.dense_dir, sd_file), map_location='cpu')
+            layer_state_dict = {}
+            for k, v in state_dict.items():
+                k_for_layer = k
+                if k.startswith(f"h.{i}."):
+                    k_for_layer = k.replace(f"h.{i}.", "")
+                layer_state_dict[k_for_layer] = v
+            
             teacher_layer = deepcopy(layer)
-            layer_state_dict = torch.load(os.path.join(self.dense_dir, f'layer_{i}'), map_location='cpu')
-            teacher_layer.load_state_dict(layer_state_dict)
-            teacher_layer = self.accelerator.prepare(teacher_layer)
+            # Disable adapters if lora enabled.
+            if isinstance(teacher_layer, LoraLayer):
+                teacher_layer.disable_adapters = True
+            missing_keys, unexpected_keys = teacher_layer.load_state_dict(layer_state_dict, strict=False)
+            # if missing_keys:
+            #     self.logger.warning(f"Missing keys for teacher of layer{i}: {missing_keys}")
+            # if unexpected_keys:
+            #     self.logger.warning(f"Unexpected keys for teacher of layer{i}: {unexpected_keys}")
+
+            teacher_layer = teacher_layer.to(self.dev)
             teacher_layer.eval()
 
+            del state_dict, layer_state_dict
+            
             # Output hidden states of teacher, this will be regarded as the input hidden states for next layer
-            teacher_out_hs = torch.zeros_like(in_hs)
+            teacher_out_hs = torch.zeros_like(teacher_in_hs)
             with torch.no_grad():
                 for j in range(num_samples):
                     # NOTE: [0] means extracting hidden states from the output tuple
-                    teacher_out_hs[j] = teacher_layer(in_hs[j].unsqueeze(0).to(self.dev), attention_mask=attention_mask, alibi=alibi)[0]
+                    teacher_out_hs[j] = teacher_layer(teacher_in_hs[j].unsqueeze(0).to(self.dev), attention_mask=attention_mask, alibi=alibi)[0]
             del teacher_layer
-            self.accelerator.clear()
+            gc.collect()
 
             layer = self.accelerator.prepare(layer)
             unwrapped_layer = self.accelerator.unwrap_model(layer)
@@ -170,14 +193,12 @@ class SparseBloomSequential(SequentialForward):
                 for name in subset:
                     if not (min_layer <= i < max_layer and prune_only in name):
                         continue
-
-                    gpts[name] = SparseGPT(subset[name])
+                    gpts[name] = SparseGPT(subset[name]) if pruner == 'sparsegpt' else ABCSolver(subset[name])
 
                 def add_batch(name):
                     def tmp(_, inp, out):
                         # inp 是 tuple，取第一个代表 input_ids
                         gpts[name].add_batch(inp[0].data, out.data)
-
                     return tmp
             
                 handles = [subset[name].register_forward_hook(add_batch(name)) for name in gpts]
@@ -185,7 +206,7 @@ class SparseBloomSequential(SequentialForward):
                 # (真正的记录过程在后面)
                 # 而是为了 SparseGPT() 做 add_batch()，让前面的注册的 hook 发挥作用
                 for j in range(num_samples):
-                    unwrapped_layer(in_hs[j].unsqueeze(0).to(self.dev), attention_mask=attention_mask, alibi=alibi)
+                    unwrapped_layer(teacher_in_hs[j].unsqueeze(0).to(self.dev), attention_mask=attention_mask, alibi=alibi)
                 for h in handles:
                     h.remove()
 
@@ -193,22 +214,31 @@ class SparseBloomSequential(SequentialForward):
                 self.logger.info(f"Pruning layer{i}..")
                 for name in gpts:
                     self.logger.info(f"Module: {name}")
-                    gpts[name].fasterprune(sparsity, **prune_kwargs)
+                    if pruner == 'sparsegpt':
+                        gpts[name].fasterprune(sparsity, **prune_kwargs)
+                    else:
+                        gpts[name].prune_structured(sparsity, **prune_kwargs)
                     # Binary sparse mask (0|1)
                     self.sparse_mask[name] = (subset[name].weight.abs() > self.sparse_thresh).to(dtype=dtype, device='cpu')
                 self.logger.info("Done!\n")
-                del gpts
+
+                del gpts, subset
+
+                # Cut out the relationship between layers
+                # Feed next layer with teacher outputs of previous layer
+                in_hs = teacher_out_hs.detach().clone()
             # Align with teacher
             else:
                 optimizer = self.accelerator.prepare(torch.optim.AdamW(unwrapped_layer.parameters(), lr=lr))
                 optimizer.zero_grad(set_to_none=True)
 
-                out_hs = torch.zeros_like(in_hs, device=self.dev)
+                out_hs = torch.zeros_like(in_hs)
                 for j in range(num_samples):
                     # NOTE: [0] means extracting hidden states from the output tuple
                     out_hs[j] = layer(in_hs[j].unsqueeze(0).to(self.dev), attention_mask=attention_mask, alibi=alibi)[0]
+                
+                out_hs = out_hs.to(self.dev)
                 var = out_hs.pow(2).mean(dim=-1, keepdim=True)
-
                 teacher_out_hs = teacher_out_hs.to(device=self.dev)
                 teacher_var = teacher_out_hs.pow(2).mean(dim=-1, keepdim=True)
 
@@ -218,27 +248,50 @@ class SparseBloomSequential(SequentialForward):
                     out_hs / (var + 1e-6),
                     teacher_out_hs / (teacher_var + 1e-6)
                 )
-                # TODO: be careful here!
+
+                # Computing loss by per-sample
+                # loss = 0.
+                # for stu, tea in zip(out_hs, teacher_out_hs):
+                #     stu_var = stu.pow(2).mean(dim=-1, keepdim=True).to(self.dev)
+                #     tea_var = tea.pow(2).mean(dim=-1, keepdim=True).to(self.dev)
+                #     # Do normalization like LayerNorm
+                #     per_loss = F.mse_loss(
+                #         stu.to(self.dev) / (stu_var + 1e-6),
+                #         tea.to(self.dev) / (tea_var + 1e-6)
+                #     )
+                #     loss = loss + per_loss
+                #     del stu_var, tea_var, per_loss
+                # loss /= num_samples
+
+                # NOTE: use 'accelerator.backward()' instead of 'loss.backward()',
+                # this can help us to do scaling for mixed precision loss
                 self.accelerator.backward(loss / grad_scale)
                 layer_losses.append(loss.item())
+                # del loss
                 del loss, var, teacher_var
 
+                # Cosine similarity between sparse & dense
                 with torch.no_grad():
-                    # TODO: be careful here!
-                    # Cosine similarity between sparse & dense
+                    # NOTE: be careful! fp16 is unfriend to 'F.cosine_similarity()'
                     sim = F.cosine_similarity(
                         out_hs.reshape(-1, hidden_size),
                         teacher_out_hs.reshape(-1, hidden_size)
                     ).mean()
-                
-                del out_hs
+                    # del out_hs
+                    # sim = 0.
+                    # for sp, ds in zip(out_hs, teacher_out_hs):
+                    #     # NOTE: be careful! fp16 is unfriend to 'F.cosine_similarity()' 
+                    #     per_sim = F.cosine_similarity(sp.to(self.dev).float(), ds.to(self.dev).float()).mean()
+                    #     sim = sim + per_sim
+                    #     del per_sim
+                    # sim /= num_samples
                 # Reduce across all process
                 sim = (self.accelerator.reduce(sim) / self.accelerator.num_processes).item()
                 similarities.append(sim)
 
                 # Update parameters
                 optimizer.step()
-                # TODO: be careful here!
+                # NOTE: keep in mind that clear accumulated gradients
                 optimizer.zero_grad(set_to_none=True)
                 del optimizer
 
@@ -249,18 +302,22 @@ class SparseBloomSequential(SequentialForward):
                         mask = self.sparse_mask[name].to(module.weight.device)
                         module.weight.data = module.weight.data * mask
 
-            layers[i] = unwrapped_layer.to('cpu')
-            del layer
+                # Feed next layer with current outputs
+                in_hs = out_hs.detach().cpu()
+                del out_hs
 
-            # Cut out the relationship between layers
-            in_hs = teacher_out_hs.detach().cpu()
+            layers[i] = unwrapped_layer.cpu()
+            del layer, unwrapped_layer
+
+            # Keep hidden states feeded for teacher are come from dense
+            teacher_in_hs = teacher_out_hs.cpu()
             del teacher_out_hs
 
             self.accelerator.clear()
 
-        del in_hs
-        torch.cuda.empty_cache()
+        del in_hs, teacher_in_hs
         gc.collect()
+        torch.cuda.empty_cache()
 
         self.model.config.use_cache = use_cache
 
@@ -291,7 +348,7 @@ class SparseBloomSequential(SequentialForward):
         # 记录每个样本在输入 BloomBlock 前的 hidden state
         in_hs = torch.zeros(
             (num_samples, seq_length, hidden_size),
-            dtype=dtype, device=self.dev
+            dtype=dtype, device='cpu'
         )
 
         # 记录当前 forward 到第几个 BloomBlock 以及对应的一些状态
@@ -300,29 +357,34 @@ class SparseBloomSequential(SequentialForward):
         # 从而将每个样本在输入第一个 BloomBlock 前的 hidden state 记录下来
         layers[0] = Catcher(layers[0], cache, in_hs)
         for i in range(num_samples):
-            sample = {k: v[i].unsqueeze(0) for k, v in batch.items()}
+            sample = {k: v[i].unsqueeze(0).to(self.dev) for k, v in batch.items()}
             try:
                 self.model(**sample)
             except ValueError:
                 pass
 
-        layers[0] = self.accelerator.unwrap_model(layers[0].module).to('cpu')
+        ''' GPU -> CPU '''
+
+        layers[0] = self.accelerator.unwrap_model(layers[0].module).cpu()
         self.model.transformer.word_embeddings = self.accelerator.unwrap_model(
             self.model.transformer.word_embeddings
-        ).to('cpu')
+        ).cpu()
         self.model.transformer.word_embeddings_layernorm = self.accelerator.unwrap_model(
             self.model.transformer.word_embeddings_layernorm
-        ).to('cpu')
+        ).cpu()
         self.accelerator.clear()
 
-        alibi = cache['alibi']
-        attention_mask = cache['attention_mask']
+        alibi = cache.pop('alibi')
+        attention_mask = cache.pop('attention_mask')
+        del cache
 
-        for i in range(len(layers)):
+        for i in tqdm(range(len(layers)), desc="Layer-by-Layer Forward", disable=not self.accelerator.is_local_main_process):
             layer = self.accelerator.prepare(layers[i])
+            unwrapped_layer = self.accelerator.unwrap_model(layer)
+
             # 将稀疏的部分置0
             if hard_sparse_weight:
-                subset = find_layers(layer)
+                subset = find_layers(unwrapped_layer)
                 for name in subset:
                     W = subset[name].weight.data
                     # 例如稀疏率是75%，那么先有小到大排序，然后将前 75% 的参数值置0
@@ -331,10 +393,10 @@ class SparseBloomSequential(SequentialForward):
 
             for j in range(num_samples):
                 # 每个 BloomBlock 的输出是元组，取第一个代表 hidden states
-                in_hs[j] = layer(in_hs[j].unsqueeze(0), attention_mask=attention_mask, alibi=alibi)[0]
+                in_hs[j] = layer(in_hs[j].unsqueeze(0).to(self.dev), attention_mask=attention_mask, alibi=alibi)[0]
 
-            layers[i] = self.accelerator.unwrap_model(layer).to('cpu')
-            del layer
+            layers[i] = unwrapped_layer.cpu()
+            del layer, unwrapped_layer
             self.accelerator.clear()
         
         self.model.transformer.ln_f = self.accelerator.prepare(self.model.transformer.ln_f)
@@ -343,9 +405,9 @@ class SparseBloomSequential(SequentialForward):
         loss_fct = nn.CrossEntropyLoss()
 
         loss = 0.
-        for k in range(num_samples):
+        for k in tqdm(range(num_samples), desc="Per sample evaluation", disable=not self.accelerator.is_local_main_process):
             # Cast to float32 for better performance
-            logits = self.model.lm_head(self.model.transformer.ln_f(in_hs[k].unsqueeze(0))).to(torch.float32)
+            logits = self.model.lm_head(self.model.transformer.ln_f(in_hs[k].unsqueeze(0).to(self.dev))).float()
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = batch['labels'][k][..., 1:].contiguous().to(shift_logits.device)
 
@@ -353,8 +415,8 @@ class SparseBloomSequential(SequentialForward):
             loss = loss + loss_per_sample / num_samples
         del logits, shift_logits, shift_labels, loss_per_sample, in_hs
 
-        self.model.transformer.ln_f = self.accelerator.unwrap_model(self.model.transformer.ln_f).to('cpu')
-        self.model.lm_head = self.accelerator.unwrap_model(self.model.lm_head).to('cpu')
+        self.model.transformer.ln_f = self.accelerator.unwrap_model(self.model.transformer.ln_f).cpu()
+        self.model.lm_head = self.accelerator.unwrap_model(self.model.lm_head).cpu()
         self.accelerator.clear()
 
         self.model.config.use_cache = use_cache

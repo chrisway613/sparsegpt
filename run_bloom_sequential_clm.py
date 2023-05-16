@@ -23,6 +23,8 @@ from accelerate import Accelerator, InitProcessGroupKwargs
 from transformers import default_data_collator
 from transformers.models.bloom import BloomConfig, BloomTokenizerFast, BloomForCausalLM
 
+from peft import LoraConfig, TaskType, get_peft_model
+
 from sequential import SequentialForward, SparseBloomSequential
 # from sequential_single_gpu_fp32 import SequentialForward, SparseBloomSequential
 # from sequential_single_gpu_amp import SequentialForward, SparseBloomSequential
@@ -48,11 +50,11 @@ class StateStdout:
         self.logger.info(f"{self.end}\n")
 
 
-def skip(*args, **kwargs):
+def disable_torch_init():
+
+    def skip(*args, **kwargs):
         pass
 
-
-def disable_torch_init():
     torch.nn.init.normal_ = skip
     torch.nn.init.uniform_ = skip
     torch.nn.init.kaiming_uniform_ = skip
@@ -92,6 +94,12 @@ def parse_args():
         help="Path to pretrained model or model identifier from huggingface.co/models."
     )
     parser.add_argument(
+        "--model_name",
+        type=str,
+        required=True,
+        help="Model identifier from huggingface.co/models."
+    )
+    parser.add_argument(
         "--model_cache_dir",
         type=str,
         default=None,
@@ -128,7 +136,7 @@ def parse_args():
     parser.add_argument(
         "--max_seq_length",
         type=int,
-        default=512,
+        default=256,
         help="Max sequence length of a data sample."
     )
     parser.add_argument(
@@ -161,6 +169,22 @@ def parse_args():
         default=0,
         help="Number of steps for the warmup training."
     )
+    parser.add_argument(
+        "--use_gradient_checkpointing",
+        action="store_true",
+        help="Whether to use gradient checkpointing, this is for memory efficiency."
+    )
+    parser.add_argument(
+        "--lora",
+        action="store_true",
+        help="Whether to use Low-Rank decomposition."
+    )
+    parser.add_argument(
+        "--lora_rank",
+        type=int,
+        default=128,
+        help="Lora attention dimension."
+    )
 
     # Prune
     parser.add_argument(
@@ -177,6 +201,12 @@ def parse_args():
         type=int,
         default=128,
         help="Batch size (per device) for the pruning dataloader.",
+    )
+    parser.add_argument(
+        "--pruner",
+        type=str,
+        default="sparsegpt",
+        help="Pruner type."
     )
     parser.add_argument(
         '--percdamp', type=float, default=.01,
@@ -321,7 +351,7 @@ if __name__ == '__main__':
             data['train'] = data['train'].select(train_indices)
 
     # Tokenize data texts
-    tokenizer = BloomTokenizerFast.from_pretrained(args.model_name_or_path, cache_dir=args.model_cache_dir)
+    tokenizer = BloomTokenizerFast.from_pretrained(args.model_name, cache_dir=args.model_cache_dir)
 
     column_names = data['train'].column_names
     text_column_name = "text" if "text" in column_names else column_names[0]
@@ -375,21 +405,24 @@ if __name__ == '__main__':
     
     # Data split
     val_data = data['validation']
-    if not args.eval_full_data and len(val_data) > 1280:
-        data['validation'] = data['validation'].select(range(1280))
-        logger.info("NOTE: only 1280 samples of validation data selected.")
-    if not args.eval_only:
-        train_data = data['train']
+    # TODO: uncomment below
+    # if not args.eval_full_data and len(val_data) > 1280:
+    #     data['validation'] = data['validation'].select(range(1280))
+    #     logger.info("NOTE: only 1280 samples of validation data selected.")
+    # if not args.eval_only:
+    #     train_data = data['train']
+    # TODO: remove future, just use test set for better performance currently
+    train_data = data['test']
+    val_data = data['test']
     if args.debug:
-        train_data = data['train'].select(range(96))
-        # NOTE: debug=overfit
+        train_data = train_data.select(range(96))
+        # NOTE: debug also means overfit
         val_data = train_data
-        logger.info(f"NOTE: debug mode on! only 96 train(eval) data samples selected.\n")
-    
+        logger.info(f"NOTE: debug mode on! only 96 train(eval) data samples selected.")
+
     logger.info(f"\tNum validation data = {len(val_data)}")
     if not args.eval_only:
         logger.info(f"\tNum training data = {len(train_data)}")
-    logger.info("\n")
 
     # Log a few random samples from the training set:
     for index in random.sample(range(len(train_data)), 3):
@@ -414,14 +447,31 @@ if __name__ == '__main__':
     model = BloomForCausalLM.from_pretrained(
         args.model_name_or_path,
         config=model_config,
-        # torch_dtype='auto',
+        # torch_dtype=torch.bfloat16,
         cache_dir=args.model_cache_dir
     )
+
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
     # on a small vocab and want a smaller embedding size, remove this test.
     embedding_size = model.get_input_embeddings().weight.shape[0]
     if len(tokenizer) > embedding_size:
         model.resize_token_embeddings(len(tokenizer))
+
+    # Enable gradient checkpointing for memory efficiency
+    if args.use_gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+    # Enable lora
+    if args.lora:
+        lora_modules = ["query_key_value", "self_attention.dense", "dense_h_to_4h", "dense_4h_to_h"]
+        lora_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=args.lora_rank, target_modules=lora_modules, 
+            lora_alpha=args.lora_rank, lora_dropout=0., enable_lora=[True]
+        )
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
+    
+    logger.info(f"Model dtype: {model.dtype}\n")
     logger.info(f"\nModel structure:\n{model}\n")
 
     # Model that performs sequential forwarding
@@ -435,7 +485,12 @@ if __name__ == '__main__':
     # Dense model evaluation
     if args.eval_dense:
         with StateStdout(logger=logger, begin="Dense model eval"):
-            sequential_eval(sequential_model, val_data, eval_dataloader, accelerator)
+            # TODO: verify this
+            if args.lora:
+                with model.disable_adapter():
+                    sequential_eval(sequential_model, val_data, eval_dataloader, accelerator)
+            else:
+                sequential_eval(sequential_model, val_data, eval_dataloader, accelerator)
 
     # Log global messages
     per_device_batch_size = args.per_device_train_batch_size \
@@ -514,6 +569,7 @@ if __name__ == '__main__':
                                 sparsity=sparsity,
                                 prunen=args.prunen,
                                 prunem=args.prunem,
+                                pruner=args.pruner,
                                 percdamp=args.percdamp
                             )
 
@@ -539,21 +595,21 @@ if __name__ == '__main__':
                 # Show loss when a specified time arrival
                 if step % (10 * args.gradient_accumulation_steps) == 0:
                     for i, (loss, sim) in enumerate(zip(layer_loss_batch, layer_similarity_batch)):
-                        logger.info(f"layer {i}\t loss {loss}\t similarity {sim}")
+                        logger.info(f"layer {i}\t loss {loss}\t similarity {sim}\n")
 
                 if (step + 1) % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                     completed_step += 1
-                    progress_bar.update(1)
+                    progress_bar.update()
                 
                 # Eval when meeting a specified step
-                if (step + 1) % (100 * args.gradient_accumulation_steps) == 0:
-                    with StateStdout(logger=logger, begin=f"Eval in step{step + 1}"):
-                        ppl = sequential_eval(
-                            sequential_model,
-                            val_data, eval_dataloader, accelerator, verbose=False,
-                            hard_sparse_weight=args.gmp, sparse_ratio=(sparsity if completed_prune_times else 0.)
-                        )
-                        logger.info(f"Epoch {epoch + 1}\t Step {step + 1}\t Perplexity {ppl}\n")
+                # if (step + 1) % (100 * args.gradient_accumulation_steps) == 0:
+                #     with StateStdout(logger=logger, begin=f"Eval in step{step + 1}"):
+                #         ppl = sequential_eval(
+                #             sequential_model,
+                #             val_data, eval_dataloader, accelerator, verbose=False,
+                #             hard_sparse_weight=args.gmp, sparse_ratio=(sparsity if completed_prune_times else 0.)
+                #         )
+                #         logger.info(f"Epoch {epoch + 1}\t Step {step + 1}\t Perplexity {ppl}\n")
 
             # Show epoch loss of each layer
             logger.info(f"[Epoch{epoch + 1} Losses]")

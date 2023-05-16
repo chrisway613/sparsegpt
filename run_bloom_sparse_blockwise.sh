@@ -2,10 +2,11 @@
 
 LOG=${1}
 
-CUDA_VISIBLE_DEVICES=0 \
+CUDA_VISIBLE_DEVICES=5,6 \
 nohup accelerate launch run_bloom_blockwise_clm.py \
-    --model_name_or_path bigscience/bloom-7b1 \
-    --model_cache_dir /ssd1/models/bloom \
+    --model_name bigscience/bloom \
+    --model_name_or_path /ssd6/xiangyangkan/models/huggingface-models/bloom-176b \
+    --model_cache_dir /ssd6/xiangyangkan/models/huggingface-models/bloom-176b \
     --dataset_name wikitext \
     --dataset_config_name wikitext-2-raw-v1 \
     --data_cache_dir /ssd1/datasets/wikitext \
@@ -19,8 +20,9 @@ nohup accelerate launch run_bloom_blockwise_clm.py \
     --per_device_prune_batch_size 128 \
     --dense_metric 15.291 \
     --sparse \
-    --sparsities 0.5 \
+    --sparsities 0.96875 \
     --sparse_steps 0 \
-    --path_to_dense bloom-7b1-dense \
-    --output_dir bloom-7b1-2x-blockwise-lr0.1-constant \
+    --pruner abc_solver \
+    --percdamp 0.1 \
+    --output_dir bloom-176b-32x-blockwise-lr0.1 \
     >> $LOG.log 2>&1 &

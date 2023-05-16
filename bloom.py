@@ -1,13 +1,20 @@
+import os
+import gc
+import json
 import argparse
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from tqdm import tqdm
+from copy import deepcopy
 
-from sparsegpt import SparseGPT
+from transformers import BloomForCausalLM
+
 from datautils import get_loaders
 from modelutils import find_layers
+from sparsegpt import SparseGPT, ABCSolver
 
 
 try:
@@ -17,8 +24,7 @@ except:
     has_wandb = False    
 
 
-def get_bloom(model):
-    import torch
+def get_bloom(model, seq_len=256, model_dtype=torch.bfloat16):
     
     def skip(*args, **kwargs):
         pass
@@ -27,17 +33,19 @@ def get_bloom(model):
     torch.nn.init.kaiming_uniform_ = skip
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
-
-    from transformers import BloomForCausalLM
     
-    model = BloomForCausalLM.from_pretrained(model, cache_dir='/ssd1/models/bloom', torch_dtype='auto')
-    model.seqlen = 2048
+    model = BloomForCausalLM.from_pretrained(
+        model, 
+        cache_dir=args.model_cache_dir, 
+        torch_dtype=model_dtype
+    )
+    model.seqlen = seq_len
     
     return model
 
 
 @torch.no_grad()
-def bloom_sequential(model, dataloader, dev, means=None, stds=None):
+def bloom_sequential(model, dataloader, dev='cpu', abc_solver=False):
     print('Starting..\n')
 
     use_cache = model.config.use_cache
@@ -45,10 +53,10 @@ def bloom_sequential(model, dataloader, dev, means=None, stds=None):
 
     layers = model.transformer.h
 
-    model.transformer.word_embeddings = model.transformer.word_embeddings.to(dev)
-    model.transformer.word_embeddings_layernorm = model.transformer.word_embeddings_layernorm.to(dev)
+    model.transformer.word_embeddings = model.transformer.word_embeddings.to(DEV)
+    model.transformer.word_embeddings_layernorm = model.transformer.word_embeddings_layernorm.to(DEV)
     # The 1st BloomBlock
-    layers[0] = layers[0].to(dev)
+    layers[0] = layers[0].to(DEV)
 
     dtype = next(iter(model.parameters())).dtype
     # 记录每个样本在输入 BloomBlock 前的 hidden state
@@ -80,42 +88,45 @@ def bloom_sequential(model, dataloader, dev, means=None, stds=None):
     for batch in dataloader:
         try:
             # batch 是 (input_id, target)，它们的 shape 均是 (1, seq_length)
-            model(batch[0].to(dev))
+            model(batch[0].to(DEV))
         except ValueError:
             pass
 
-    # layers[0] = layers[0].module
-    # layers[0] = layers[0].cpu()
     layers[0] = layers[0].module.cpu()
     model.transformer.word_embeddings = model.transformer.word_embeddings.cpu()
     model.transformer.word_embeddings_layernorm = model.transformer.word_embeddings_layernorm.cpu()
     
     torch.cuda.empty_cache()
 
+    attention_mask = cache.pop('attention_mask')
+    alibi = cache.pop('alibi')
+    del cache
+
     # 记录每个样本经过 BloomBlock 输出后的 hidden states
     outs = torch.zeros_like(inps)
-    attention_mask = cache['attention_mask']
-    alibi = cache['alibi']
+
+    with open(os.path.join(args.save, 'pytorch_model.bin.index.json')) as f:
+        weight_index = deepcopy(json.load(f))
 
     print('Ready!\n')
 
     for i in range(len(layers)):
-        layer = layers[i].to(dev)
+        layer = layers[i].to(DEV)
         # 返回一个字典，找出当前 BloomBlock 下的所有 Linear 层
-        subset = find_layers(layer)
+        # subset = find_layers(layer)
+        # TODO
+        subset = find_layers(layer, name=f'h.{i}')
 
         gpts = {}
         for name in subset:
             if (not (args.minlayer <= i < args.maxlayer and args.prune_only in name)) == (not args.invert):
                 continue
-
-            gpts[name] = SparseGPT(subset[name])
+            gpts[name] = ABCSolver(subset[name]) if abc_solver else SparseGPT(subset[name])
 
         def add_batch(name):
             def tmp(_, inp, out):
                 # inp 是 tuple，取第一个代表 input_ids
                 gpts[name].add_batch(inp[0].data, out.data)
-
             return tmp
         
         handles = []
@@ -126,8 +137,10 @@ def bloom_sequential(model, dataloader, dev, means=None, stds=None):
         # (真正的记录过程在后面)
         # 而是为了 SparseGPT() 做 add_batch()，让前面的注册的 hook 发挥作用
         for j in range(args.nsamples):
-            # outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, alibi=alibi)[0]
-            layer(inps[j].unsqueeze(0), attention_mask=attention_mask, alibi=alibi)
+            # Outptus from dense
+            outs[j] = layer(inps[j].unsqueeze(0).to(DEV), attention_mask=attention_mask, alibi=alibi)[0]
+            # inps[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, alibi=alibi)[0]
+            # layer(inps[j].unsqueeze(0), attention_mask=attention_mask, alibi=alibi)
 
         for h in handles:
             h.remove()
@@ -137,32 +150,67 @@ def bloom_sequential(model, dataloader, dev, means=None, stds=None):
         for name in gpts:
             print(f"layer: {i}\tname: {name}")
 
-            gpts[name].fasterprune(
-                args.sparsity,
-                prunen=args.prunen,
-                prunem=args.prunem,
-                percdamp=args.percdamp
-            )
+            if abc_solver:
+                gpts[name].prune_structured(
+                    args.sparsity,
+                    percdamp=args.percdamp
+                )
+            else:
+                gpts[name].fasterprune(
+                    args.sparsity,
+                    prunen=args.prunen,
+                    prunem=args.prunem,
+                    percdamp=args.percdamp
+                )
+
         print("Done!\n")
 
         # Pruning 后，记录每个样本经过当前 BloomBlock 输出后的 hidden state
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, alibi=alibi)[0]
+            # Outputs from sparse
+            inps[j] = layer(inps[j].unsqueeze(0).to(DEV), attention_mask=attention_mask, alibi=alibi)[0]
 
         layers[i] = layer.cpu()
 
-        del gpts
-        # TODO: verify this
-        del layer
+        del gpts, layer
+        gc.collect()
         torch.cuda.empty_cache()
 
-        inps, outs = outs, inps
+        # Cosine similarity between sparse & dense.
+        sim = 0.
+        for sp, ds in zip(inps, outs):
+            per_sim = F.cosine_similarity(sp.to(device=DEV, dtype=torch.float32), ds.to(device=DEV, dtype=torch.float32)).mean().item()
+            sim += per_sim / args.nsamples
+        print(f"[Layer{i}] Cosine similarity between sparse & dense: {sim}\n")
+
+        # Save the state dict of current layer
+        dst = os.path.join(args.save, f"pytorch_model_layer{i}.bin")
+        sd = layers[i].state_dict(prefix=f"h.{i}.")
+        torch.save(sd, dst)
+        print(f"Sparse state dict of layer{i} has been saved to {dst}\n")
+
+        sd_map = {}.fromkeys(sd.keys(), os.path.basename(dst))
+        weight_index['weight_map'].update(sd_map)
+
+        del sd, sd_map
+        gc.collect()
+
+        # Inputs of the next layer comes from the outputs of current dense layer.
+        inps = outs.clone()
+
+    del inps, outs
+    gc.collect()
+    torch.cuda.empty_cache()
 
     model.config.use_cache = use_cache
 
+    with open(os.path.join(args.save, 'pytorch_model.bin.index.json'), 'w') as f:
+        json.dump(weight_index, f)
+    print(f"Weight index already dump to {os.path.join(args.save, 'pytorch_model.bin.index.json')}")
+
 
 @torch.no_grad()
-def bloom_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
+def bloom_eval(model, testenc, dataset: str, dev='cpu', log_wandb: bool = False):
     print('Evaluation..\n')
 
     testenc = testenc.input_ids
@@ -173,9 +221,9 @@ def bloom_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
 
     layers = model.transformer.h
 
-    model.transformer.word_embeddings = model.transformer.word_embeddings.to(dev)
-    model.transformer.word_embeddings_layernorm = model.transformer.word_embeddings_layernorm.to(dev)
-    layers[0] = layers[0].to(dev)
+    model.transformer.word_embeddings = model.transformer.word_embeddings.to(DEV)
+    model.transformer.word_embeddings_layernorm = model.transformer.word_embeddings_layernorm.to(DEV)
+    layers[0] = layers[0].to(DEV)
 
     dtype = next(iter(model.parameters())).dtype
     inps = torch.zeros(
@@ -200,26 +248,24 @@ def bloom_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
         
     layers[0] = Catcher(layers[0])
     for i in range(nsamples):
-        batch = testenc[:, (i * model.seqlen):((i + 1) * model.seqlen)].to(dev)
+        batch = testenc[:, (i * model.seqlen):((i + 1) * model.seqlen)].to(DEV)
         try:
             model(batch)
         except ValueError:
             pass
 
-    # layers[0] = layers[0].module
-    # layers[0] = layers[0].cpu()
     layers[0] = layers[0].module.cpu()
     model.transformer.word_embeddings = model.transformer.word_embeddings.cpu()
     model.transformer.word_embeddings_layernorm = model.transformer.word_embeddings_layernorm.cpu()
 
     torch.cuda.empty_cache()
 
-    outs = torch.zeros_like(inps)
-    attention_mask = cache['attention_mask']
-    alibi = cache['alibi']
+    attention_mask = cache.pop('attention_mask')
+    alibi = cache.pop('alibi')
+    del cache
 
-    for i in range(len(layers)):
-        layer = layers[i].to(dev)
+    for i in tqdm(range(len(layers)), desc="Sequential Forward"):
+        layer = layers[i].to(DEV)
 
         # 将稀疏的部分置0
         if args.gmp:
@@ -231,25 +277,22 @@ def bloom_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
                 W.data[torch.abs(W.data) <= thresh] = 0
 
         for j in range(nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, alibi=alibi)[0]
+            inps[j] = layer(inps[j].unsqueeze(0).to(DEV), attention_mask=attention_mask, alibi=alibi)[0]
 
         layers[i] = layer.cpu()
-
         del layer
+        
+        gc.collect()
         torch.cuda.empty_cache()
 
-        inps, outs = outs, inps
+    model.transformer.ln_f = model.transformer.ln_f.to(DEV)
+    model.lm_head = model.lm_head.to(DEV)
 
-    model.transformer.ln_f = model.transformer.ln_f.to(dev)
-    model.lm_head = model.lm_head.to(dev)
-
-    # TODO: pls see line 260
-    # testenc = testenc.to(dev)
     loss_fct = nn.CrossEntropyLoss()
 
     nlls = []
-    for i in tqdm(range(nsamples)):
-        hidden_states = inps[i].unsqueeze(0)
+    for i in tqdm(range(nsamples), desc="Per sample evaluation"):
+        hidden_states = inps[i].unsqueeze(0).to(DEV)
         # hidden_states = model.transformer.ln_f(hidden_states)
         # lm_logits = model.lm_head(hidden_states)
         lm_logits = model.lm_head(model.transformer.ln_f(hidden_states))
@@ -260,11 +303,18 @@ def bloom_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
         # ][:, 1:]
         shift_labels = testenc[
             :, (i * model.seqlen):((i + 1) * model.seqlen)
-        ][:, 1:].to(dev)
+        ][:, 1:].to(DEV)
         loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
         neg_log_likelihood = loss.float() * model.seqlen
         nlls.append(neg_log_likelihood)
+
+        del loss
+        gc.collect()
+    
+    model.transformer.ln_f = model.transformer.ln_f.cpu()
+    model.lm_head = model.lm_head.cpu()
+
     ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
     print(f"Perplexity over {nsamples} samples: {ppl.item():3f}\n")
 
@@ -286,12 +336,34 @@ def parse_args():
         help='Where to extract calibration data from.'
     )
     parser.add_argument(
+        "--model_name",
+        type=str,
+        help="model identifier from huggingface.co/models, used for initial tokenizer."
+    )
+    parser.add_argument(
+        "--model_cache_dir",
+        type=str,
+        default=None,
+        help="Directory of model weights to be cached in."
+    )
+    parser.add_argument(
+        "--data_cache_dir",
+        type=str,
+        default=None,
+        help="Directory of the dataset to be cached.",
+    )
+    parser.add_argument(
         '--seed',
         type=int, default=42, help='Seed for sampling the calibration data.'
     )
     parser.add_argument(
-        '--nsamples', type=int, default=128,
+        '--nsamples', type=int, default=256,
         help='Number of calibration data samples.'
+    )
+    parser.add_argument(
+        "--abc_solver",
+        action="store_true",
+        help="Whether to use ABC Solver(default is SparseGPT)."
     )
     parser.add_argument(
         '--percdamp', type=float, default=.01,
@@ -350,13 +422,18 @@ def parse_args():
         help="Whether to do evaluation for dense."
     )
     parser.add_argument(
+        "--eval_sparse",
+        action="store_true",
+        help="Whether to do evaluation after pruning."
+    )
+    parser.add_argument(
         '--debug',
         action='store_true',
         help='Whether to turn on debug mode. If true, only 1000 samples will be selected for training data.'
     )
 
     args = parser.parse_args()
-    # init W&B logging
+    # Init W&B logging
     if args.log_wandb:
         assert has_wandb, "wandb not installed try `pip install wandb`"
         wandb.init(config=args)
@@ -373,35 +450,43 @@ if __name__ == '__main__':
     model = get_bloom(args.model)
     model.eval()
 
+    # dataloader, testloader = get_loaders(
+    #     args.dataset, nsamples=args.nsamples,
+    #     model=args.model_name, cache_dir=args.model_cache_dir,
+    #     seqlen=model.seqlen, seed=args.seed, debug=args.debug
+    # )
     dataloader, testloader = get_loaders(
-        args.dataset, nsamples=args.nsamples,
-        seed=args.seed, model=args.model,
-        seqlen=model.seqlen, debug=args.debug
+        args.dataset, nsamples=args.nsamples, data_cache_dir=args.data_cache_dir,
+        model=args.model_name, tokenizer_cache_dir=args.model_cache_dir,
+        seqlen=model.seqlen, seed=args.seed, debug=args.debug,
+        test=True  # load testset
     )
+    # NOTE: this is for use all data
+    args.nsamples = len(dataloader)
 
     if args.eval_dense:
         print("[Eval for dense]")
-        bloom_eval(model, testloader, DEV, args.dataset, args.log_wandb)
+        bloom_eval(model, testloader, args.dataset, log_wandb=args.log_wandb)
 
     if (args.sparsity or args.prunen) and not args.gmp:
-        bloom_sequential(model, dataloader, DEV)
-        # for n, p in model.named_parameters():
-        #     print(f"name: {n}\tsparsity: {torch.mean((p == 0).float())}")
-        #     # 仅看第一个 BloomBlock，因为后面都是同样的情况
-        #     if 'dense_4h_to_h' in n:
-        #         break
+        bloom_sequential(model, dataloader, abc_solver=args.abc_solver)
+        # Check sparsity
         for name, module in model.named_modules():
             if isinstance(module, nn.Linear) and 'head' not in name:
-                print(f"name: {name}\tsparsity: {torch.mean((module.weight == 0).float())}")
+                print(f"Module: {name}\t Sparsity: {torch.mean((module.weight == 0).float())}")
 
-    # for dataset in ['wikitext2', 'ptb', 'c4']:
-        # _, testloader = get_loaders(
-        #     dataset, seed=args.seed,
-        #     model=args.model, seqlen=model.seqlen
-        # )
-        # print(f"Dataset: {dataset}")
-        # bloom_eval(model, testloader, DEV, dataset, args.log_wandb)
+    if args.eval_sparse:
+        # for dataset in ['wikitext2', 'ptb', 'c4']:
+            # _, testloader = get_loaders(
+            #     dataset, seed=args.seed,
+            #     model=args.model, seqlen=model.seqlen
+            # )
+            # print(f"Dataset: {dataset}")
+            # bloom_eval(model, testloader, DEV, dataset, args.log_wandb)
+        
+        # TODO: remove future, for debug currentl
+        bloom_eval(model, testloader, args.dataset, log_wandb=args.log_wandb)
+        # bloom_eval(model, testloader, DEV, args.dataset, args.log_wandb)
 
-    bloom_eval(model, testloader, DEV, args.dataset, args.log_wandb)
-    if args.save:
-        model.save_pretrained(args.save)
+    # if args.save:
+    #     model.save_pretrained(args.save)
