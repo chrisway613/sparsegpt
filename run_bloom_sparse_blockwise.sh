@@ -12,15 +12,15 @@ nohup accelerate launch run_bloom_blockwise_clm.py \
     --num_train_epochs 1000 \
     --per_device_train_batch_size 32 \
     --per_device_eval_batch_size 32 \
-    --learning_rate 1 \
+    --learning_rate 0.1 \
     --optimizer_type sgd \
     --lr_scheduler_type constant \
     --num_prune_samples 128 \
     --per_device_prune_batch_size 128 \
-    --eval_dense \
+    --dense_metric 15.291 \
     --sparse \
     --sparsities 0.5 \
     --sparse_steps 0 \
     --path_to_dense bloom-7b1-dense \
-    --output_dir bloom-7b1-2x-blockwise-sgd-lr1_constant \
+    --output_dir bloom-7b1-2x-blockwise-lr0.1-constant \
     >> $LOG.log 2>&1 &

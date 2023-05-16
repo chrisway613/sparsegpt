@@ -94,6 +94,10 @@ def disable_torch_init():
     torch.nn.init.kaiming_uniform_ = skip
 
 
+def get_max_grad(model: nn.Module):
+    return max([p.grad.detach().abs().max().item() for p in model.parameters() if p.grad is not None])
+
+
 @torch.no_grad()
 def sequential_eval(
     model: nn.Module, dataset, dataloader, accelerator: Accelerator,
@@ -877,18 +881,18 @@ if __name__ == '__main__':
                     gc.collect()
                     
                     # Eval after pruning
-                    with StateStdout(logger=logger, begin=f"Eval after layer {layer_i + 1} pruned .."):
-                        ppl = sequential_eval(
-                            model,
-                            val_data, eval_dataloader, accelerator,
-                            hard_sparse_weight=args.gmp, sparse_ratio=sparsity
-                        )
+                    # with StateStdout(logger=logger, begin=f"Eval after layer {layer_i + 1} pruned .."):
+                    #     ppl = sequential_eval(
+                    #         model,
+                    #         val_data, eval_dataloader, accelerator,
+                    #         hard_sparse_weight=args.gmp, sparse_ratio=sparsity
+                    #     )
 
-                        # NOTE: 'sequential_eval()' will Release all memories,
-                        # so we should put layer back to proper device
-                        if isinstance(layers[layer_i], nn.Module):
-                            layers[layer_i] = accelerator.prepare(layers[layer_i])
-                            unwrapped_layer = accelerator.unwrap_model(layers[layer_i])
+                    #     # NOTE: 'sequential_eval()' will Release all memories,
+                    #     # so we should put layer back to proper device
+                    #     if isinstance(layers[layer_i], nn.Module):
+                    #         layers[layer_i] = accelerator.prepare(layers[layer_i])
+                    #         unwrapped_layer = accelerator.unwrap_model(layers[layer_i])
 
                 # Loss among all data
                 layer_loss = 0.
@@ -956,6 +960,8 @@ if __name__ == '__main__':
 
                     progress_bar.update()
 
+                # Get the max parameter gradients
+                max_grad = get_max_grad(unwrapped_layer)
                 # Update parameters
                 optimizer.step()
                 # [BE CAREFUL] Clear accumulated gradients if parameters updated
@@ -977,24 +983,9 @@ if __name__ == '__main__':
                         module.weight.data = module.weight.data * mask
                         MASK[name] = mask.cpu()
 
-                # Eval when a epoch done
-                with StateStdout(logger=logger, begin=f"Eval in epoch {epoch + 1} .."):
-                    ppl = sequential_eval(
-                        model,
-                        val_data, eval_dataloader, accelerator, verbose=False,
-                        hard_sparse_weight=args.gmp, sparse_ratio=(sparsity if completed_prune_times else 0.)
-                    )
-
-                    # NOTE: 'sequential_eval()' will Release all memories,
-                    # so we should put layer back to proper device
-                    if isinstance(layers[layer_i], nn.Module):
-                        layers[layer_i] = accelerator.prepare(layers[layer_i])
-                        unwrapped_layer = accelerator.unwrap_model(layers[layer_i])
-                
-                # Log training info when the epoch done
                 logger.info(
                     f"[Layer {layer_i + 1}]\t Epoch {epoch + 1}\t lr {lr}\t next lr {next_lr}\n"
-                    f"Loss {layer_loss}\t Similarity {layer_similarity}\t Perplexity {ppl}\n"
+                    f"Max Grad {max_grad}\t Loss {layer_loss}\t Similarity {layer_similarity}\n"
                 )
                 
                 ''' Release memories '''
@@ -1017,8 +1008,6 @@ if __name__ == '__main__':
             # GPU -> CPU
             layers[layer_i] = unwrapped_layer.to('cpu')
             del unwrapped_layer, optimizer, lr_scheduler
-            # Releases all references to the internal objects stored and call the garbage collector
-            accelerator.clear()
             
         model.config.use_cache = use_cache
 
@@ -1036,6 +1025,14 @@ if __name__ == '__main__':
             )
             if accelerator.is_main_process:
                 tokenizer.save_pretrained(args.output_dir)
+        
+        # Final eval
+        with StateStdout(logger=logger, begin=f"Final eval .."):
+            sequential_eval(
+                model,
+                val_data, eval_dataloader, accelerator,
+                hard_sparse_weight=args.gmp, sparse_ratio=(sparsity if completed_prune_times else 0.)
+            )
 
     # Releases all references to the internal objects stored and call the garbage collector.
     accelerator.clear()
