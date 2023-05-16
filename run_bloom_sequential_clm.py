@@ -182,7 +182,7 @@ def parse_args():
     parser.add_argument(
         "--lora_rank",
         type=int,
-        default=32,
+        default=128,
         help="Lora attention dimension."
     )
 
@@ -405,25 +405,24 @@ if __name__ == '__main__':
     
     # Data split
     val_data = data['validation']
-    if not args.eval_full_data and len(val_data) > 1280:
-        data['validation'] = data['validation'].select(range(1280))
-        logger.info("NOTE: only 1280 samples of validation data selected.")
-    if not args.eval_only:
-        train_data = data['train']
+    # TODO: uncomment below
+    # if not args.eval_full_data and len(val_data) > 1280:
+    #     data['validation'] = data['validation'].select(range(1280))
+    #     logger.info("NOTE: only 1280 samples of validation data selected.")
+    # if not args.eval_only:
+    #     train_data = data['train']
+    # TODO: remove future, just use test set for better performance currently
+    train_data = data['test']
+    val_data = data['test']
     if args.debug:
-        train_data = data['train'].select(range(96))
+        train_data = train_data.select(range(96))
         # NOTE: debug also means overfit
         val_data = train_data
-        logger.info(f"NOTE: debug mode on! only 96 train(eval) data samples selected.\n")
-    # TODO: remove future, just use test set for better performance currently
-    else:
-        train_data = data['test']
-        val_data = data['test']
+        logger.info(f"NOTE: debug mode on! only 96 train(eval) data samples selected.")
 
     logger.info(f"\tNum validation data = {len(val_data)}")
     if not args.eval_only:
         logger.info(f"\tNum training data = {len(train_data)}")
-    logger.info("\n")
 
     # Log a few random samples from the training set:
     for index in random.sample(range(len(train_data)), 3):
@@ -451,21 +450,29 @@ if __name__ == '__main__':
         # torch_dtype=torch.bfloat16,
         cache_dir=args.model_cache_dir
     )
+
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
     # on a small vocab and want a smaller embedding size, remove this test.
     embedding_size = model.get_input_embeddings().weight.shape[0]
     if len(tokenizer) > embedding_size:
         model.resize_token_embeddings(len(tokenizer))
-    logger.info(f"\nModel structure:\n{model}\n")
 
     # Enable gradient checkpointing for memory efficiency
     if args.use_gradient_checkpointing:
         model.gradient_checkpointing_enable()
     # Enable lora
     if args.lora:
-        lora_config = LoraConfig(task_type=TaskType.CAUSAL_LM, r=args.lora_rank, lora_alpha=args.lora_rank * 4)
+        lora_modules = ["query_key_value", "self_attention.dense", "dense_h_to_4h", "dense_4h_to_h"]
+        lora_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=args.lora_rank, target_modules=lora_modules, 
+            lora_alpha=args.lora_rank, lora_dropout=0., enable_lora=[True]
+        )
         model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
+    
+    logger.info(f"Model dtype: {model.dtype}\n")
+    logger.info(f"\nModel structure:\n{model}\n")
 
     # Model that performs sequential forwarding
     sequential_model = SparseBloomSequential(model, accelerator, logger=logger, dense_dir=args.path_to_dense)
@@ -478,7 +485,12 @@ if __name__ == '__main__':
     # Dense model evaluation
     if args.eval_dense:
         with StateStdout(logger=logger, begin="Dense model eval"):
-            sequential_eval(sequential_model, val_data, eval_dataloader, accelerator)
+            # TODO: verify this
+            if args.lora:
+                with model.disable_adapter():
+                    sequential_eval(sequential_model, val_data, eval_dataloader, accelerator)
+            else:
+                sequential_eval(sequential_model, val_data, eval_dataloader, accelerator)
 
     # Log global messages
     per_device_batch_size = args.per_device_train_batch_size \
@@ -590,14 +602,14 @@ if __name__ == '__main__':
                     progress_bar.update()
                 
                 # Eval when meeting a specified step
-                if (step + 1) % (100 * args.gradient_accumulation_steps) == 0:
-                    with StateStdout(logger=logger, begin=f"Eval in step{step + 1}"):
-                        ppl = sequential_eval(
-                            sequential_model,
-                            val_data, eval_dataloader, accelerator, verbose=False,
-                            hard_sparse_weight=args.gmp, sparse_ratio=(sparsity if completed_prune_times else 0.)
-                        )
-                        logger.info(f"Epoch {epoch + 1}\t Step {step + 1}\t Perplexity {ppl}\n")
+                # if (step + 1) % (100 * args.gradient_accumulation_steps) == 0:
+                #     with StateStdout(logger=logger, begin=f"Eval in step{step + 1}"):
+                #         ppl = sequential_eval(
+                #             sequential_model,
+                #             val_data, eval_dataloader, accelerator, verbose=False,
+                #             hard_sparse_weight=args.gmp, sparse_ratio=(sparsity if completed_prune_times else 0.)
+                #         )
+                #         logger.info(f"Epoch {epoch + 1}\t Step {step + 1}\t Perplexity {ppl}\n")
 
             # Show epoch loss of each layer
             logger.info(f"[Epoch{epoch + 1} Losses]")

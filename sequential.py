@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 from copy import deepcopy
 
+from peft.tuners.lora import LoraLayer
 from accelerate.logging import get_logger
 
 from modelutils import find_layers
@@ -147,13 +148,30 @@ class SparseBloomSequential(SequentialForward):
             layer = layers[i]
 
             # Load dense weights
-            teacher_layer = deepcopy(layer)
             sd_file = f"pytorch_model_{(i + 2):0>5d}-of-00072.bin"
-            layer_state_dict = torch.load(os.path.join(self.dense_dir, sd_file), map_location='cpu')
-            teacher_layer.load_state_dict(layer_state_dict)
+            state_dict = torch.load(os.path.join(self.dense_dir, sd_file), map_location='cpu')
+            layer_state_dict = {}
+            for k, v in state_dict.items():
+                k_for_layer = k
+                if k.startswith(f"h.{i}."):
+                    k_for_layer = k.replace(f"h.{i}.", "")
+                layer_state_dict[k_for_layer] = v
+            
+            teacher_layer = deepcopy(layer)
+            # Disable adapters if lora enabled.
+            if isinstance(teacher_layer, LoraLayer):
+                teacher_layer.disable_adapters = True
+            missing_keys, unexpected_keys = teacher_layer.load_state_dict(layer_state_dict, strict=False)
+            # if missing_keys:
+            #     self.logger.warning(f"Missing keys for teacher of layer{i}: {missing_keys}")
+            # if unexpected_keys:
+            #     self.logger.warning(f"Unexpected keys for teacher of layer{i}: {unexpected_keys}")
+
             teacher_layer = teacher_layer.to(self.dev)
             teacher_layer.eval()
 
+            del state_dict, layer_state_dict
+            
             # Output hidden states of teacher, this will be regarded as the input hidden states for next layer
             teacher_out_hs = torch.zeros_like(teacher_in_hs)
             with torch.no_grad():
@@ -207,6 +225,7 @@ class SparseBloomSequential(SequentialForward):
                 del gpts, subset
 
                 # Cut out the relationship between layers
+                # Feed next layer with teacher outputs of previous layer
                 in_hs = teacher_out_hs.detach().clone()
             # Align with teacher
             else:
@@ -218,53 +237,54 @@ class SparseBloomSequential(SequentialForward):
                     # NOTE: [0] means extracting hidden states from the output tuple
                     out_hs[j] = layer(in_hs[j].unsqueeze(0).to(self.dev), attention_mask=attention_mask, alibi=alibi)[0]
                 
-                # var = out_hs.pow(2).mean(dim=-1, keepdim=True)
-                # teacher_out_hs = teacher_out_hs.to(device=self.dev)
-                # teacher_var = teacher_out_hs.pow(2).mean(dim=-1, keepdim=True)
+                out_hs = out_hs.to(self.dev)
+                var = out_hs.pow(2).mean(dim=-1, keepdim=True)
+                teacher_out_hs = teacher_out_hs.to(device=self.dev)
+                teacher_var = teacher_out_hs.pow(2).mean(dim=-1, keepdim=True)
 
                 # 每一层在每个 batch 上的 loss
                 # 在算 loss 前做 layernorm 方式的归一化
-                # loss = F.mse_loss(
-                #     out_hs / (var + 1e-6),
-                #     teacher_out_hs / (teacher_var + 1e-6)
-                # )
+                loss = F.mse_loss(
+                    out_hs / (var + 1e-6),
+                    teacher_out_hs / (teacher_var + 1e-6)
+                )
 
                 # Computing loss by per-sample
-                loss = 0.
-                for stu, tea in zip(out_hs, teacher_out_hs):
-                    stu_var = stu.pow(2).mean(dim=-1, keepdim=True).to(self.dev)
-                    tea_var = tea.pow(2).mean(dim=-1, keepdim=True).to(self.dev)
-                    # Do normalization like LayerNorm
-                    per_loss = F.mse_loss(
-                        stu.to(self.dev) / (stu_var + 1e-8),
-                        tea.to(self.dev) / (tea_var + 1e-8)
-                    )
-                    loss = loss + per_loss
-                    del stu_var, tea_var, per_loss
-                loss /= num_samples
+                # loss = 0.
+                # for stu, tea in zip(out_hs, teacher_out_hs):
+                #     stu_var = stu.pow(2).mean(dim=-1, keepdim=True).to(self.dev)
+                #     tea_var = tea.pow(2).mean(dim=-1, keepdim=True).to(self.dev)
+                #     # Do normalization like LayerNorm
+                #     per_loss = F.mse_loss(
+                #         stu.to(self.dev) / (stu_var + 1e-6),
+                #         tea.to(self.dev) / (tea_var + 1e-6)
+                #     )
+                #     loss = loss + per_loss
+                #     del stu_var, tea_var, per_loss
+                # loss /= num_samples
 
                 # NOTE: use 'accelerator.backward()' instead of 'loss.backward()',
                 # this can help us to do scaling for mixed precision loss
                 self.accelerator.backward(loss / grad_scale)
                 layer_losses.append(loss.item())
-                del loss
-                # del loss, var, teacher_var
+                # del loss
+                del loss, var, teacher_var
 
                 # Cosine similarity between sparse & dense
                 with torch.no_grad():
                     # NOTE: be careful! fp16 is unfriend to 'F.cosine_similarity()'
-                    # sim = F.cosine_similarity(
-                    #     out_hs.reshape(-1, hidden_size),
-                    #     teacher_out_hs.reshape(-1, hidden_size)
-                    # ).mean()
+                    sim = F.cosine_similarity(
+                        out_hs.reshape(-1, hidden_size),
+                        teacher_out_hs.reshape(-1, hidden_size)
+                    ).mean()
                     # del out_hs
-                    sim = 0.
-                    for sp, ds in zip(out_hs, teacher_out_hs):
-                        # NOTE: be careful! fp16 is unfriend to 'F.cosine_similarity()' 
-                        per_sim = F.cosine_similarity(sp.to(self.dev).float(), ds.to(self.dev).float())
-                        sim = sim + per_sim
-                        del per_sim
-                    sim /= num_samples
+                    # sim = 0.
+                    # for sp, ds in zip(out_hs, teacher_out_hs):
+                    #     # NOTE: be careful! fp16 is unfriend to 'F.cosine_similarity()' 
+                    #     per_sim = F.cosine_similarity(sp.to(self.dev).float(), ds.to(self.dev).float()).mean()
+                    #     sim = sim + per_sim
+                    #     del per_sim
+                    # sim /= num_samples
                 # Reduce across all process
                 sim = (self.accelerator.reduce(sim) / self.accelerator.num_processes).item()
                 similarities.append(sim)
@@ -282,6 +302,7 @@ class SparseBloomSequential(SequentialForward):
                         mask = self.sparse_mask[name].to(module.weight.device)
                         module.weight.data = module.weight.data * mask
 
+                # Feed next layer with current outputs
                 in_hs = out_hs.detach().cpu()
                 del out_hs
 

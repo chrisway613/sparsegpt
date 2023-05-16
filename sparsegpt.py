@@ -1,3 +1,4 @@
+import gc
 import math
 import time
 
@@ -311,6 +312,7 @@ class ABCSolver(MoffettSolver):
 
         H = self.H
         del self.H
+        gc.collect()
 
         ''' -------- Start from ABC Solver ------------ '''
 
@@ -367,7 +369,10 @@ class ABCSolver(MoffettSolver):
         H = torch.linalg.cholesky(H)
         H = torch.cholesky_inverse(H)
         H = torch.linalg.cholesky(H, upper=True)
+
         Hinv = H
+        del H
+        gc.collect()
 
         ''' -------- Start from ABC Solver ------------ '''
 
@@ -412,6 +417,10 @@ class ABCSolver(MoffettSolver):
         if isinstance(self.layer, transformers.Conv1D):
             W = W.t()
         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
+
+        del W
+        gc.collect()
+
         if DEBUG:
             if verbose:
                 print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))

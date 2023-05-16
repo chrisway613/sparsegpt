@@ -63,7 +63,10 @@ def get_wikitext2_testloader(nsamples, seed, seqlen, model, tokenizer_cache_dir=
         inp = testenc.input_ids[:, i:j]
         tar = inp.clone()
         tar[:, :-1] = -100
+        
         testloader.append((inp, tar))
+        if len(testloader) == nsamples:
+            break
 
         i = j
     print(f"Total {len(testloader)} samples.\n")

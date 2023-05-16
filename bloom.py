@@ -357,7 +357,7 @@ def parse_args():
         type=int, default=42, help='Seed for sampling the calibration data.'
     )
     parser.add_argument(
-        '--nsamples', type=int, default=128,
+        '--nsamples', type=int, default=256,
         help='Number of calibration data samples.'
     )
     parser.add_argument(
@@ -422,13 +422,18 @@ def parse_args():
         help="Whether to do evaluation for dense."
     )
     parser.add_argument(
+        "--eval_sparse",
+        action="store_true",
+        help="Whether to do evaluation after pruning."
+    )
+    parser.add_argument(
         '--debug',
         action='store_true',
         help='Whether to turn on debug mode. If true, only 1000 samples will be selected for training data.'
     )
 
     args = parser.parse_args()
-    # init W&B logging
+    # Init W&B logging
     if args.log_wandb:
         assert has_wandb, "wandb not installed try `pip install wandb`"
         wandb.init(config=args)
@@ -465,26 +470,23 @@ if __name__ == '__main__':
 
     if (args.sparsity or args.prunen) and not args.gmp:
         bloom_sequential(model, dataloader, abc_solver=args.abc_solver)
-        # for n, p in model.named_parameters():
-        #     print(f"name: {n}\tsparsity: {torch.mean((p == 0).float())}")
-        #     # 仅看第一个 BloomBlock，因为后面都是同样的情况
-        #     if 'dense_4h_to_h' in n:
-        #         break
+        # Check sparsity
         for name, module in model.named_modules():
             if isinstance(module, nn.Linear) and 'head' not in name:
-                print(f"name: {name}\tsparsity: {torch.mean((module.weight == 0).float())}")
+                print(f"Module: {name}\t Sparsity: {torch.mean((module.weight == 0).float())}")
 
-    # for dataset in ['wikitext2', 'ptb', 'c4']:
-        # _, testloader = get_loaders(
-        #     dataset, seed=args.seed,
-        #     model=args.model, seqlen=model.seqlen
-        # )
-        # print(f"Dataset: {dataset}")
-        # bloom_eval(model, testloader, DEV, dataset, args.log_wandb)
-    
-    # TODO: remove future, for debug currentl
-    bloom_eval(model, testloader, args.dataset, log_wandb=args.log_wandb)
+    if args.eval_sparse:
+        # for dataset in ['wikitext2', 'ptb', 'c4']:
+            # _, testloader = get_loaders(
+            #     dataset, seed=args.seed,
+            #     model=args.model, seqlen=model.seqlen
+            # )
+            # print(f"Dataset: {dataset}")
+            # bloom_eval(model, testloader, DEV, dataset, args.log_wandb)
+        
+        # TODO: remove future, for debug currentl
+        bloom_eval(model, testloader, args.dataset, log_wandb=args.log_wandb)
+        # bloom_eval(model, testloader, DEV, args.dataset, args.log_wandb)
 
-    # bloom_eval(model, testloader, DEV, args.dataset, args.log_wandb)
     # if args.save:
     #     model.save_pretrained(args.save)

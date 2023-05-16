@@ -1,4 +1,3 @@
-import os
 import gc
 import math
 import random
@@ -27,10 +26,13 @@ from accelerate import Accelerator, InitProcessGroupKwargs
 from transformers import default_data_collator, SchedulerType, get_scheduler
 from transformers.models.bloom import BloomConfig, BloomTokenizerFast, BloomForCausalLM
 
+from transformers.models.bloom.modeling_bloom import BloomBlock
+
 from peft import LoraConfig, TaskType, get_peft_model
 
 from modelutils import find_layers
 from sparsegpt import SparseGPT, ABCSolver
+from chatllm_data_utils import create_prompt_dataset
 
 
 logger = get_logger(__name__)
@@ -84,6 +86,15 @@ class BatchCatcher(Catcher):
         raise ValueError
 
 
+class MultiBloomBlocks(nn.Sequential):    
+    def forward(self, hidden_states: torch.Tensor, alibi: torch.Tensor, attention_mask: torch.Tensor):
+        for module in self:
+            # NOTE: The output from BloomBlock is tuple, so we use subscript [0] for extracting hidden states
+            hidden_states = module(hidden_states, alibi, attention_mask)[0]
+        # Return tuple for consistent with the output form of a single block
+        return (hidden_states,)
+
+
 def disable_torch_init():
     """ Disable initialization of Pytorch. """
 
@@ -129,10 +140,10 @@ def sequential_eval(
         ''' CPU -> GPU '''
 
         # Embedding layer & the 1st Layer Norm
-        model.transformer.word_embeddings = word_embed = accelerator.prepare(word_embed)
-        model.transformer.word_embeddings_layernorm = word_embed_ln = accelerator.prepare(word_embed_ln)
+        model.transformer.word_embeddings = word_embed = accelerator.prepare_model(word_embed)
+        model.transformer.word_embeddings_layernorm = word_embed_ln = accelerator.prepare_model(word_embed_ln)
         # The 1st BloomBlock
-        layers[0] = accelerator.prepare(layers[0])
+        layers[0] = accelerator.prepare_model(layers[0])
 
         ''' Collect output hidden states from embedding layer '''
 
@@ -167,9 +178,9 @@ def sequential_eval(
         accelerator._models.clear()
 
         # Sequential forwarding
-        for i in range(len(layers)):
+        for i in tqdm(range(len(layers)), desc="layer-by-layer forwarding", disable=not accelerator.is_local_main_process):
             # CPU -> GPU
-            layers[i] = accelerator.prepare(layers[i])
+            layers[i] = accelerator.prepare_model(layers[i])
             # 将稀疏的部分置 0
             if hard_sparse_weight:
                 subset = find_layers(accelerator.unwrap_model(layers[i]))
@@ -189,13 +200,12 @@ def sequential_eval(
             accelerator._models.clear()
         
         # CPU -> GPU
-        model.transformer.ln_f = ln_f = accelerator.prepare(ln_f)
-        model.lm_head = lm_head = accelerator.prepare(lm_head)
+        model.transformer.ln_f = ln_f = accelerator.prepare_model(ln_f)
+        model.lm_head = lm_head = accelerator.prepare_model(lm_head)
 
         batch_loss = []
-        for hs_sample, label in zip(hs, batch['labels']):
-            # Force to fp32 for stability
-            logits = lm_head(ln_f(hs_sample.unsqueeze(0).to(dev))).float()
+        for hs_sample, label in tqdm(zip(hs, batch['labels']), desc="per-sample counting loss", disable=not accelerator.is_local_main_process):
+            logits = lm_head(ln_f(hs_sample.unsqueeze(0).to(dev)))
             # Current token predict the next one
             logits = logits[:, :-1, :].contiguous()
             shift_labels = label.unsqueeze(0)[..., 1:].contiguous()
@@ -290,9 +300,9 @@ def layer_prune(
         if pruner == 'sparsegpt':
             gpts[name].fasterprune(sparsity, **kwargs)
         else:
-            gpts[name].prune_structured(sparsity, percdamp=kwargs.pop('percdamp', 0.01))
+            gpts[name].prune_structured(sparsity, **kwargs)
         
-        # Reduce across all process
+        # Reduce across all processes.
         subset[name].weight.data = accelerator.reduce(subset[name].weight.data, reduction="mean")
         # Binary sparse mask (0|1)
         MASK[name] = (subset[name].weight.abs() > sparse_thresh).to(dtype=dtype, device='cpu')
@@ -430,12 +440,6 @@ def parse_args():
         help='Number of calibration data samples for pruning.'
     )
     parser.add_argument(
-        "--per_device_prune_batch_size",
-        type=int,
-        default=128,
-        help="Batch size (per device) for the pruning dataloader.",
-    )
-    parser.add_argument(
         '--percdamp', type=float, default=.01,
         help='Percent of the average Hessian diagonal to use for dampening.'
     )
@@ -476,6 +480,17 @@ def parse_args():
         help='Prune only layers that contain this text.'
     )
     parser.add_argument(
+        "--per_layer_pruning",
+        action="store_true",
+        help="Whether to prune only one layer(or it can be multiple layers) each time."
+    )
+    parser.add_argument(
+        "--num_layers_aggregated",
+        type=int,
+        default=1,
+        help="Num layers to be aggragated to a module for training each time."
+    )
+    parser.add_argument(
         "--dense_metric",
         type=float,
         default=0.,
@@ -487,11 +502,6 @@ def parse_args():
         '--eval_dense',
         action='store_true',
         help="Do evaluation for dense model."
-    )
-    parser.add_argument(
-        "--dump_dense",
-        action="store_true",
-        help="Record dense weights to a specified path."
     )
     parser.add_argument(
         "--eval_only",
@@ -551,44 +561,39 @@ if __name__ == '__main__':
     # Random seed
     set_seed(args.seed)
 
-    # Debug mode
-    if not args.debug:
-        # Make output directory if not existed
-        os.makedirs(args.output_dir, exist_ok=True)
-
     accelerator.wait_for_everyone()
 
     # Load dataset
-    with StateStdout(logger=logger, begin="Loading datset", end="Done"):
-        data = load_dataset(
-            args.dataset_name, args.dataset_config_name,
-            cache_dir=args.data_cache_dir, use_auth_token=True
-        )
-        if 'validation' not in data:
-            # val : train = 5% : 95%
-            num_val_samples = int(0.05 * len(data['train']))
-            val_indices = random.sample(range(len(data['train'])), num_val_samples)
-            train_indices = [i for i in range(len(data['train'])) if i not in val_indices]
-            assert len(train_indices) + len(val_indices) == len(data['train'])
+    # with StateStdout(logger=logger, begin="Loading datset", end="Done"):
+    #     data = load_dataset(
+    #         args.dataset_name, args.dataset_config_name,
+    #         cache_dir=args.data_cache_dir, use_auth_token=True
+    #     )
+    #     if 'validation' not in data:
+    #         # val : train = 5% : 95%
+    #         num_val_samples = int(0.05 * len(data['train']))
+    #         val_indices = random.sample(range(len(data['train'])), num_val_samples)
+    #         train_indices = [i for i in range(len(data['train'])) if i not in val_indices]
+    #         assert len(train_indices) + len(val_indices) == len(data['train'])
 
-            data['validation'] = data['train'].select(val_indices)
-            data['train'] = data['train'].select(train_indices)
+    #         data['validation'] = data['train'].select(val_indices)
+    #         data['train'] = data['train'].select(train_indices)
 
     # Tokenize data texts
     tokenizer = BloomTokenizerFast.from_pretrained(args.model_name, cache_dir=args.model_cache_dir)
 
-    column_names = data['train'].column_names
-    text_column_name = "text" if "text" in column_names else column_names[0]
+    # column_names = data['train'].column_names
+    # text_column_name = "text" if "text" in column_names else column_names[0]
 
-    with accelerator.main_process_first():
-        data = data.map(
-            lambda samples: tokenizer(samples[text_column_name]),
-            batched=True,
-            num_proc=8,
-            remove_columns=column_names,
-            load_from_cache_file=True,
-            desc="Running tokenizer on dataset"
-        )
+    # with accelerator.main_process_first():
+    #     data = data.map(
+    #         lambda samples: tokenizer(samples[text_column_name]),
+    #         batched=True,
+    #         num_proc=8,
+    #         remove_columns=column_names,
+    #         load_from_cache_file=True,
+    #         desc="Running tokenizer on dataset"
+    #     )
     
     if args.max_seq_length > tokenizer.model_max_length:
         args.max_seq_length = tokenizer.model_max_length
@@ -598,52 +603,66 @@ if __name__ == '__main__':
         )
     
     # Processing data
-    def group_texts(examples):
-        """ Concatenate all texts from dataset and generate chunks of max_sequence_length. """
+    # def group_texts(examples):
+    #     """ Concatenate all texts from dataset and generate chunks of max_sequence_length. """
 
-        # Concatenate all texts
-        concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
-        total_length = len(concatenated_examples[list(examples.keys())[0]])
-        # We drop the small remainder, we could add padding if the model supported it instead of this drop
-        if total_length >= args.max_seq_length:
-            total_length = (total_length // args.max_seq_length) * args.max_seq_length
+    #     # Concatenate all texts
+    #     concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
+    #     total_length = len(concatenated_examples[list(examples.keys())[0]])
+    #     # We drop the small remainder, we could add padding if the model supported it instead of this drop
+    #     if total_length >= args.max_seq_length:
+    #         total_length = (total_length // args.max_seq_length) * args.max_seq_length
 
-        # Split by chunks of max_seq_length
-        result = {
-            k: [t[i: i + args.max_seq_length]
-                for i in range(0, total_length, args.max_seq_length)]
-            for k, t in concatenated_examples.items()
-        }
-        result["labels"] = result["input_ids"].copy()
+    #     # Split by chunks of max_seq_length
+    #     result = {
+    #         k: [t[i: i + args.max_seq_length]
+    #             for i in range(0, total_length, args.max_seq_length)]
+    #         for k, t in concatenated_examples.items()
+    #     }
+    #     result["labels"] = result["input_ids"].copy()
 
-        return result
+    #     return result
 
-    with accelerator.main_process_first():
-        data = data.map(
-            group_texts,
-            batched=True,
-            num_proc=8,
-            load_from_cache_file=True,
-            desc=f"Grouping texts in chunks of {args.max_seq_length}",
-        )
+    # with accelerator.main_process_first():
+    #     data = data.map(
+    #         group_texts,
+    #         batched=True,
+    #         num_proc=8,
+    #         load_from_cache_file=True,
+    #         desc=f"Grouping texts in chunks of {args.max_seq_length}",
+    #     )
     
     # Data split
-    val_data = data['validation']
-    # TODO: uncomment below
-    # if not args.eval_full_data and len(val_data) > 1280:
-    #     data['validation'] = data['validation'].select(range(1280))
-    #     logger.info("NOTE: only 1280 samples of validation data selected.")
-    # if not args.eval_only:
-    #     train_data = data['train']
-    # TODO: remove future, just use test set for better performance currently
-    train_data = data['test']
-    val_data = data['test']
-    if args.debug:
-        train_data = train_data.select(range(96))
-        # NOTE: debug=overfit
-        val_data = train_data
-        logger.info(f"NOTE: debug mode on! only 96 train(eval) data samples selected.\n")
+    # val_data = data['validation']
+    # # TODO: uncomment below
+    # # if not args.eval_full_data and len(val_data) > 1280:
+    # #     data['validation'] = data['validation'].select(range(1280))
+    # #     logger.info("NOTE: only 1280 samples of validation data selected.")
+    # # if not args.eval_only:
+    # #     train_data = data['train']
+    # # TODO: remove future, just use test set for better performance currently
+    # train_data = data['test']
+    # val_data = data['test']
+    # if args.debug:
+    #     train_data = train_data.select(range(96))
+    #     # NOTE: debug=overfit
+    #     val_data = train_data
+    #     logger.info(f"NOTE: debug mode on! only 96 train(eval) data samples selected.\n")
     
+    train_phase = 1
+    train_data, val_data = create_prompt_dataset(
+        accelerator.local_process_index,
+        ["sharegpt:/home.local/weicai/chatllm/datasets/sharegpt-train.json|/home.local/weicai/chatllm/datasets/sharegpt-eval.json",
+         "instruction:/home.local/weicai/chatllm/datasets/instruction-train.json|/home.local/weicai/chatllm/datasets/instruction-eval.json"
+        ],
+        "1,0,0",
+        "./chatllm_data_files",
+        1,
+        args.seed,
+        tokenizer,
+        args.max_seq_length
+    )
+
     # Let u know the number of samples, no need to thx to me ~
     logger.info(f"\tNum validation data = {len(val_data)}")
     if not args.eval_only:
@@ -675,7 +694,7 @@ if __name__ == '__main__':
     model = BloomForCausalLM.from_pretrained(
         args.model_name_or_path,
         config=model_config,
-        # torch_dtype='auto',  # If set, and in fp16 training, the model params dtype will be fp16.
+        # torch_dtype=torch.bfloat16,
         cache_dir=args.model_cache_dir
     )
     
@@ -684,9 +703,6 @@ if __name__ == '__main__':
     embedding_size = model.get_input_embeddings().weight.shape[0]
     if len(tokenizer) > embedding_size:
         model.resize_token_embeddings(len(tokenizer))
-    
-    logger.info(f"Model dtype: {model.dtype}\n")
-    logger.info(f"\nModel structure:\n{model}\n")
 
     # Enable lora
     if args.lora:
@@ -694,15 +710,21 @@ if __name__ == '__main__':
         lora_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             r=args.lora_rank, target_modules=lora_modules, 
-            lora_alpha=args.lora_rank, enable_lora=[True]
+            lora_alpha=args.lora_rank, lora_dropout=0., enable_lora=[True]
         )
         model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
+    
+    logger.info(f"Model dtype: {model.dtype}\n")
+    logger.info(f"\nModel structure:\n{model}\n")
 
     # Data parallel
-    eval_dataloader = accelerator.prepare(eval_dataloader)
+    eval_dataloader = accelerator.prepare_data_loader(eval_dataloader)
     if not args.eval_only:
-        train_dataloader = accelerator.prepare(train_dataloader)
+        # For consistent with deepspeed:
+        # when intergrate with deepspeed, you must feed dataloader to acceleraotr.prepare()
+        raw_train_dataloader = train_dataloader
+        train_dataloader = accelerator.prepare_data_loader(train_dataloader)
 
     # Dense model evaluation
     if args.eval_dense:
@@ -715,9 +737,9 @@ if __name__ == '__main__':
     total_batch_size = per_device_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
     num_examples = len(train_data) if not args.eval_only else len(val_data)
     if not args.eval_only:
-        # num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-        # total_steps = num_update_steps_per_epoch * args.num_train_epochs
-        total_steps = args.num_train_epochs
+        num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+        total_steps = num_update_steps_per_epoch * args.num_train_epochs
+        # total_steps = args.num_train_epochs
 
     logger.info("\n***** BEGIN *****")
     logger.info(f"  Num examples = {num_examples}")
@@ -726,7 +748,7 @@ if __name__ == '__main__':
     if not args.eval_only:
         logger.info(f"  Num Epochs = {args.num_train_epochs}")
         logger.info(f"  Total optimization steps = {total_steps}")
-        # logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+        logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info("\n")
 
     # Eval only
@@ -755,10 +777,9 @@ if __name__ == '__main__':
         # BloomBlocks
         layers = model.transformer.h
 
-        # Output hidden states from previous dense layer
+        # Hidden states from previous sparse layer
         hs_batches = []
-        # Output hidden states from teacher
-        # out_batches = []
+        # Hidden states from teacher
         teacher_hs_batches = []
 
         alibi_batches = []
@@ -774,17 +795,19 @@ if __name__ == '__main__':
 
         # Block-wise forwarding, i.e. 
         # It is turn to the next block only after the previous block done with all batches
-        for layer_i in range(len(layers)):
+        for layer_i in range(0, len(layers), args.num_layers_aggregated):
+            layer_j = min(layer_i + args.num_layers_aggregated, len(layers))
+            sub_modules = MultiBloomBlocks(*layers[layer_i:layer_j])
+
             # CPU -> GPU
-            layers[layer_i] = accelerator.prepare(layers[layer_i])
-            unwrapped_layer = accelerator.unwrap_model(layers[layer_i])
+            sub_modules = accelerator.prepare_model(sub_modules)
+            unwrapped_modules = accelerator.unwrap_model(sub_modules)
 
             msg = "Collecting output hidden states from teacher .."
             with StateStdout(logger=logger, begin=msg):
-                layers[layer_i].eval()
+                sub_modules.eval()
 
-                with torch.no_grad():
-                    # out_batches.clear()
+                with torch.no_grad():                    
                     for batch_i, batch in tqdm(
                         enumerate(train_dataloader), desc="Collect Info",
                         disable=not accelerator.is_local_main_process
@@ -793,8 +816,8 @@ if __name__ == '__main__':
                         if layer_i == 0:
                             ''' CPU -> GPU '''
 
-                            model.transformer.word_embeddings = word_embed = accelerator.prepare(word_embed)
-                            model.transformer.word_embeddings_layernorm = word_embed_ln = accelerator.prepare(word_embed_ln)
+                            model.transformer.word_embeddings = word_embed = accelerator.prepare_model(word_embed)
+                            model.transformer.word_embeddings_layernorm = word_embed_ln = accelerator.prepare_model(word_embed_ln)
 
                             # Outputs from embedding layer
                             hs = torch.zeros(
@@ -824,7 +847,7 @@ if __name__ == '__main__':
 
                             # Extract layer from BatchCacher
                             layers[0] = layers[0].module
-                            
+
                             ''' GPU -> CPU '''
 
                             model.transformer.word_embeddings = word_embed = accelerator.unwrap_model(word_embed).cpu()
@@ -845,41 +868,35 @@ if __name__ == '__main__':
                         # [BE CAREFUL] detach and thus cut out the relationship between layers
                         # out = layers[layer_i](hs, attention_mask=attention_mask, alibi=alibi)[0].detach().cpu()
                         # out_batches.append(out)
-                        teacher_out = layers[layer_i](teacher_hs, attention_mask=attention_mask, alibi=alibi)[0].detach().cpu()
-                        teacher_hs_batches[batch_i] = teacher_out
-
-                        ''' GPU -> CPU '''
-
-                        # hs_batches[batch_i] = hs.cpu()
-                        # alibi_batches[batch_i] = alibi.cpu()
-                        # attention_mask_batches[batch_i] = attention_mask.cpu()
+                        teacher_hs_batches[batch_i] = sub_modules(teacher_hs, attention_mask=attention_mask, alibi=alibi)[0].detach().cpu()
 
                         # del out, alibi, attention_mask
-                        del teacher_out, alibi, attention_mask
+                        del teacher_hs, alibi, attention_mask
 
                         ''' Release memories '''
 
+                        # del hs
                         gc.collect()
                         torch.cuda.empty_cache()
-            
-                layers[layer_i].train()
 
-            # NOTE: here, step means number of epochs
-            completed_step = 0
-            completed_prune_times = 0
+                sub_modules.train()
 
-            total_train_steps = args.num_train_epochs * len(train_dataloader)
-            # Only show the progress bar once on each machine.
-            progress_bar = tqdm(range(total_train_steps), desc=f"Train layer {layer_i + 1}", disable=not accelerator.is_local_main_process)
+            del train_dataloader
+            # accelerator._dataloaders.pop()
+            # gc.collect()
+            # GPU -> CPU
+            sub_modules = unwrapped_modules.cpu()
+            # accelerator._models.clear()
+            accelerator.clear()
 
             # Init lr
             lr = args.learning_rate
 
             # Optimizer
             if args.optimizer_type == 'adamw':
-                optimizer = torch.optim.AdamW(unwrapped_layer.parameters(), lr=lr)
+                optimizer = torch.optim.AdamW(unwrapped_modules.parameters(), lr=lr)
             elif args.optimizer_type == 'sgd':
-                optimizer = torch.optim.SGD(unwrapped_layer.parameters(), lr)
+                optimizer = torch.optim.SGD(unwrapped_modules.parameters(), lr)
             else:
                 raise NotImplementedError(f"Got not supported optimizer: {args.optimizer_type}.")
 
@@ -891,9 +908,26 @@ if __name__ == '__main__':
                 num_training_steps=args.num_train_epochs
             )
             
-            optimizer, lr_scheduler = accelerator.prepare(optimizer, lr_scheduler)
+            # optimizer = accelerator.prepare_optimizer(optimizer)
+            # lr_scheduler = accelerator.prepare_scheduler(lr_scheduler)
+            # For consistent with deepspeed, must put them together to 'prepare()'
+            sub_modules, train_dataloader, optimizer, lr_scheduler = accelerator.prepare(
+                sub_modules, raw_train_dataloader,
+                optimizer, lr_scheduler
+            )
+            unwrapped_modules = accelerator.unwrap_model(sub_modules)
+
             # NOTE: Set initial gradients to None can save some memories
             optimizer.zero_grad(set_to_none=True)
+
+             # NOTE: here, step means number of epochs
+            completed_step = 0
+            completed_prune_times = 0
+
+            # total_train_steps = args.num_train_epochs * len(train_dataloader)
+            # Only show the progress bar once on each machine.
+            # progress_bar = tqdm(range(total_train_steps), desc=f"Train layer {layer_i + 1}", disable=not accelerator.is_local_main_process)
+            progress_bar = tqdm(range(total_steps), desc=f"Train layer {layer_i + 1}", disable=not accelerator.is_local_main_process)
 
             for epoch in range(args.num_train_epochs):
                 # Pruning
@@ -914,44 +948,63 @@ if __name__ == '__main__':
                     prune_attention_masks = torch.cat([attention_mask_batches[batch_i].clone() for batch_i in prune_batch_indices])
                     logger.info(f"{prune_hidden_states.size(0)} pruning samples selected.")
 
-                    with StateStdout(logger=logger, begin=f"Pruning layer {layer_i + 1} to sparsity {sparsity} .."):
-                        layer_prune(
-                            unwrapped_layer, sparsity,
-                            prune_hidden_states, prune_alibis, prune_attention_masks,
-                            accelerator, pruner=args.pruner, prune_target = args.prune_only, percdamp=args.percdamp
-                        )
+                    module_dev = sub_modules.device
+                    sub_modules.cpu()
 
+                    # Per layer pruning
+                    if args.per_layer_pruning:
+                        for block_i, block in enumerate(unwrapped_modules):
+                            with StateStdout(logger=logger, begin=f"Pruning layer {layer_i + block_i + 1} to sparsity {sparsity} .."):
+                                block.to(dev)
+                                layer_prune(
+                                    block, sparsity,
+                                    prune_hidden_states, prune_alibis, prune_attention_masks,
+                                    accelerator, pruner=args.pruner, prune_target=args.prune_only, percdamp=args.percdamp
+                                )
+                                block.cpu()
+                    # Multi layers pruning
+                    else:
+                        with StateStdout(logger=logger, begin=f"Pruning layer {layer_i + 1}-{layer_j} to sparsity {sparsity} .."):
+                            layer_prune(
+                                unwrapped_modules, sparsity,
+                                prune_hidden_states, prune_alibis, prune_attention_masks,
+                                accelerator, pruner=args.pruner, prune_target=args.prune_only, percdamp=args.percdamp
+                            )
+                    
+                    sub_modules.to(module_dev)
                     completed_prune_times += 1
+
                     del prune_hidden_states, prune_alibis, prune_attention_masks
                     gc.collect()
-                    
-                    # Eval after pruning
-                    # with StateStdout(logger=logger, begin=f"Eval after layer {layer_i + 1} pruned .."):
-                    #     # GPU -> CPU
-                    #     layers[layer_i] = unwrapped_layer.cpu()
+                    torch.cuda.empty_cache()
 
-                    #     ppl = sequential_eval(
+                    # Eval after pruning
+                    # with StateStdout(logger=logger, begin=f"Eval after pruning .."):
+                    #     # Offload the current modules to cpu in case of OOM,
+                    #     # cuz evaluation will put module to GPU in 'layer-by-layer' way.
+                    #     module_dev = sub_modules.device
+                    #     sub_modules.cpu()
+
+                    #     sequential_eval(
                     #         model,
                     #         val_data, eval_dataloader, accelerator,
                     #         hard_sparse_weight=args.gmp, sparse_ratio=sparsity
                     #     )
 
-                    #     # NOTE: 'sequential_eval()' will Release all memories,
-                    #     # so we should put layer back to proper device
-                    #     # if isinstance(layers[layer_i], nn.Module):
-                    #     layers[layer_i] = accelerator.prepare(layers[layer_i])
-                    #     unwrapped_layer = accelerator.unwrap_model(layers[layer_i])
+                    #     # Recover modules to proper device
+                    #     sub_modules.to(module_dev)
+                    #     sub_modules = accelerator.prepare_model(sub_modules)
 
                 # Loss among all data
-                layer_loss = 0.
+                modules_loss = 0.
                 # Cosine similarity(vs teacher) among all data
-                layer_similarity = 0.
+                modules_similarity = 0.
 
                 # Train loop
                 for batch_i in range(len(train_dataloader)):
                     ''' CPU -> GPU '''
 
-                    # Output hidden states from previous dense layer
+                    # Input hidden states for current layers
                     hs = hs_batches[batch_i].to(dev)
                     alibi = alibi_batches[batch_i].to(dev)
                     attention_mask = attention_mask_batches[batch_i].to(dev)
@@ -959,7 +1012,7 @@ if __name__ == '__main__':
                     ''' Align with teacher '''
 
                     # Forward
-                    out = layers[layer_i](hs, attention_mask=attention_mask, alibi=alibi)[0]
+                    out = sub_modules(hs, attention_mask=attention_mask, alibi=alibi)[0]
 
                     ''' CPU -> GPU '''
 
@@ -976,20 +1029,19 @@ if __name__ == '__main__':
 
                     # Loss
                     loss = F.mse_loss(
-                        out / (var + 1e-6),
-                        teacher_out / (teacher_var + 1e-6)
+                        out / (var + 1e-8),
+                        teacher_out / (teacher_var + 1e-8)
                     )
+                    raw_loss = loss.item()
+                    modules_loss += raw_loss / len(train_dataloader)
                     del var, teacher_var
 
-                    # TODO: for testing no grad accumulation
                     # Gradient accumulation
                     # loss /= len(train_dataloader)
+                    loss /= args.gradient_accumulation_steps
                     # If mixed precision training, accelerator will scale loss here
                     accelerator.backward(loss)
-                    
-                    loss = loss.item()
-                    # TODO: for no grad accumulation
-                    layer_loss += loss / len(train_dataloader)
+                    del loss
 
                     # Cosine similarity between student & teacher
                     # No need for gradients
@@ -998,66 +1050,86 @@ if __name__ == '__main__':
                             out.reshape(-1, hidden_size),
                             teacher_out.reshape(-1, hidden_size)
                         ).mean()
-                        del out, teacher_out
+                        del out
                     # Reduce across all process
                     sim = accelerator.reduce(sim, reduction="mean").item()
-                    layer_similarity += sim / len(train_dataloader)
+                    modules_similarity += sim / len(train_dataloader)
 
                     gc.collect()
                     torch.cuda.empty_cache()
 
                     # Log training info
                     if batch_i % 30 == 0:
-                        logger.info(f"epoch {epoch + 1}\t batch {batch_i + 1}\t loss {loss}\t similarity {sim}\n")
+                        lr = optimizer.param_groups[0]['lr']
+                        logger.info(f"epoch {epoch + 1}\t step {batch_i + 1}\t lr {lr}\t loss {raw_loss}\t similarity {sim}\n")
 
-                    progress_bar.update()
+                    if (batch_i + 1) % args.gradient_accumulation_steps == 0 or batch_i == len(train_dataloader) - 1:
+                        # Update parameters
+                        optimizer.step()
+                        # [BE CAREFUL] Clear accumulated gradients if parameters updated
+                        optimizer.zero_grad(set_to_none=True)
+                        # lr = optimizer.param_groups[0]['lr']
 
-                # Update parameters
-                optimizer.step()
-                # [BE CAREFUL] Clear accumulated gradients if parameters updated
-                optimizer.zero_grad(set_to_none=True)
-                lr = optimizer.param_groups[0]['lr']
+                        completed_step += 1
+                        progress_bar.update()
 
-                # Epoch counted
-                completed_step += 1
+                        # Update lr
+                        lr_scheduler.step()
+                        # next_lr = lr_scheduler.get_last_lr()[0]
+                        
+                        # Apply sparse mask
+                        if MASK:
+                            if args.per_layer_pruning:
+                                for block_i, block in enumerate(unwrapped_modules):
+                                    subset = find_layers(block)
+                                    for name, module in subset.items():
+                                        mask = MASK[name].to(module.weight.device)
+                                        module.weight.data = module.weight.data * mask
 
-                # Update lr
-                lr_scheduler.step()
-                next_lr = lr_scheduler.get_last_lr()[0]
-                
-                # Apply sparse mask
-                if MASK:
-                    subset = find_layers(unwrapped_layer)
-                    for name, module in subset.items():
-                        mask = MASK[name].to(device=module.weight.device, dtype=module.weight.dtype)
-                        module.weight.data = module.weight.data * mask
-                        MASK[name] = mask.cpu()
+                                        MASK[name] = mask.cpu()
+                                        del mask
+                                    
+                                    del subset
+                                    gc.collect()
+                            else:
+                                subset = find_layers(unwrapped_modules)
+                                for name, module in subset.items():
+                                    mask = MASK[name].to(module.weight.device)
+                                    module.weight.data = module.weight.data * mask
+
+                                    MASK[name] = mask.cpu()
+                                    del mask
+
+                                del subset
+                                gc.collect()
+                            
+                            torch.cuda.empty_cache()
 
                 # Eval when a epoch done
                 # with StateStdout(logger=logger, begin=f"Eval in epoch {epoch + 1} .."):
-                #     # GPU -> CPU
-                #     layers[layer_i] = unwrapped_layer.cpu()
+                #     # Offload the current modules to cpu in case of OOM,
+                #     # cuz evaluation will put module to GPU in 'layer-by-layer' way.
+                #     module_dev = sub_modules.device
+                #     sub_modules.cpu()
 
+                #     # Eval in kinda layer-by-layer way
                 #     ppl = sequential_eval(
-                #         model,
-                #         val_data, eval_dataloader, accelerator, verbose=False,
-                #         hard_sparse_weight=args.gmp, sparse_ratio=(sparsity if completed_prune_times else 0.)
+                #         model, val_data, eval_dataloader, accelerator,
+                #         hard_sparse_weight=args.gmp, sparse_ratio=sparsity, verbose=False
                 #     )
 
-                #     # NOTE: 'sequential_eval()' will Release all memories,
-                #     # so we should put layer back to proper device
-                #     # if isinstance(layers[layer_i], nn.Module):
-                #     layers[layer_i] = accelerator.prepare(layers[layer_i])
-                #     unwrapped_layer = accelerator.unwrap_model(layers[layer_i])
+                #     # Recover modules to proper device
+                #     sub_modules.to(module_dev)
+                #     sub_modules = accelerator.prepare_model(sub_modules)
                 
-                # Log training info when the epoch done
+                # Log training info when a epoch done
                 # logger.info(
-                #     f"[Layer {layer_i + 1}]\t Epoch {epoch + 1}\t lr {lr}\t next lr {next_lr}\n"
-                #     f"Loss {layer_loss}\t Similarity {layer_similarity}\t Perplexity {ppl}\n"
+                #     f"[Layer {layer_i + 1}]\t Epoch {epoch + 1}\n"
+                #     f"Loss {modules_loss}\t Similarity {modules_similarity}\t Perplexity {ppl}\n"
                 # )
                 logger.info(
-                    f"[Layer {layer_i + 1}]\t Epoch {epoch + 1}\t lr {lr}\t next lr {next_lr}\n"
-                    f"Loss {layer_loss}\t Similarity {layer_similarity}\n"
+                    f"[Layer {layer_i + 1}]\t Epoch {epoch + 1}\n"
+                    f"Loss {modules_loss}\t Similarity {modules_similarity}\n"
                 )
                 
                 ''' Release memories '''
@@ -1066,18 +1138,37 @@ if __name__ == '__main__':
                 torch.cuda.empty_cache()
 
                 # Done if it is close enough to teacher
-                if layer_similarity > 0.998:
-                    logger.info(f"NOTE: Similarity > 0.998, layer {layer_i + 1} is DONE!\n")
+                if modules_similarity > 0.998:
+                    logger.info(f"NOTE: Similarity > 0.998, layer {layer_i + 1}-{layer_j} are DONE!\n")
                     break
             
             # Clear sparse mask, cuz it is no use for next layer
             MASK.clear()
 
+            # Eval when current layers are done
+            with StateStdout(logger=logger, begin=f"Eval well-tuned layer {layer_i + 1}-{layer_j} .."):
+                # Offload the current modules to cpu in case of OOM,
+                # cuz evaluation will put module to GPU in 'layer-by-layer' way.
+                module_dev = sub_modules.device
+                sub_modules.cpu()
+
+                # Eval in kinda layer-by-layer way
+                sequential_eval(
+                    model, val_data, eval_dataloader, accelerator,
+                    hard_sparse_weight=args.gmp, sparse_ratio=sparsity, verbose=False
+                )
+
+                # Recover modules to proper device
+                sub_modules.to(module_dev)
+                sub_modules = accelerator.prepare_model(sub_modules)
+
             # Set input hidden states for next layer
             # Clear output hidden states from teacher(and will be set later, don't worry)
             # hs_batches, out_batches = out_batches, []
-            if layer_i < len(layers) - 1:
-                with StateStdout(logger=logger, begin=f"Collecting input hidden states for layer {layer_i + 1}"):
+
+            # Collect hidden states for next layer.
+            if layer_j < len(layers):
+                with StateStdout(logger=logger, begin=f"Collecting input hidden states for layer {layer_j}"):
                     with torch.no_grad():
                         for batch_i in tqdm(range(len(train_dataloader)), disable=not accelerator.is_local_main_process):
                             ''' CPU -> GPU '''
@@ -1087,17 +1178,22 @@ if __name__ == '__main__':
                             attention_mask = attention_mask_batches[batch_i].to(dev)
 
                             # Forward
-                            hs_batches[batch_i] = layers[layer_i](hs, attention_mask=attention_mask, alibi=alibi)[0].detach().cpu()
+                            hs_batches[batch_i] = sub_modules(hs, attention_mask=attention_mask, alibi=alibi)[0].detach().cpu()
 
                             del hs, alibi, attention_mask
                             gc.collect()
 
             # GPU -> CPU
-            layers[layer_i] = unwrapped_layer.cpu()
-            del unwrapped_layer, optimizer, lr_scheduler
+            for layer_ind in range(layer_i, layer_j):
+                layers[layer_ind] = unwrapped_modules[layer_ind - layer_i].cpu()
+            del sub_modules, unwrapped_modules, optimizer, lr_scheduler, train_dataloader
 
             # Releases all references to the internal objects stored and call the garbage collector
             accelerator.clear()
+
+            # For next layer collecting teacher hidden states
+            if layer_j < len(layers):
+                train_dataloader = accelerator.prepare_data_loader(raw_train_dataloader)
             
         model.config.use_cache = use_cache
 
@@ -1105,6 +1201,7 @@ if __name__ == '__main__':
         del hs_batches, teacher_hs_batches, alibi_batches, attention_mask_batches
         del prune_hidden_states, prune_alibis, prune_attention_masks
         gc.collect()
+        torch.cuda.empty_cache()
 
         # Save results if not in debug mode.
         if not args.debug:
