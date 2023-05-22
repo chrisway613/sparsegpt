@@ -12,7 +12,7 @@ import datasets
 import transformers
 
 from tqdm.auto import tqdm
-from itertools import chain
+# from itertools import chain
 from datetime import timedelta
 
 from datasets import load_dataset
@@ -28,7 +28,7 @@ from transformers.models.bloom import BloomConfig, BloomTokenizerFast, BloomForC
 
 from transformers.models.bloom.modeling_bloom import BloomBlock
 
-from peft import LoraConfig, TaskType, get_peft_model
+# from peft import LoraConfig, TaskType, get_peft_model
 
 from modelutils import find_layers
 from sparsegpt import SparseGPT, ABCSolver
@@ -652,8 +652,8 @@ if __name__ == '__main__':
     train_phase = 1
     train_data, val_data = create_prompt_dataset(
         accelerator.local_process_index,
-        ["sharegpt:/home.local/weicai/chatllm/datasets/sharegpt-train.json|/home.local/weicai/chatllm/datasets/sharegpt-eval.json",
-         "instruction:/home.local/weicai/chatllm/datasets/instruction-train.json|/home.local/weicai/chatllm/datasets/instruction-eval.json"
+        [
+            "sharegpt:/hdd66/chatllm_datasets/sharegpt-train.json|/hdd66/chatllm_datasets/sharegpt-eval.json"
         ],
         "1,0,0",
         "./chatllm_data_files",
@@ -705,15 +705,15 @@ if __name__ == '__main__':
         model.resize_token_embeddings(len(tokenizer))
 
     # Enable lora
-    if args.lora:
-        lora_modules = ["query_key_value", "self_attention.dense", "dense_h_to_4h", "dense_4h_to_h"]
-        lora_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            r=args.lora_rank, target_modules=lora_modules, 
-            lora_alpha=args.lora_rank, lora_dropout=0., enable_lora=[True]
-        )
-        model = get_peft_model(model, lora_config)
-        model.print_trainable_parameters()
+    # if args.lora:
+    #     lora_modules = ["query_key_value", "self_attention.dense", "dense_h_to_4h", "dense_4h_to_h"]
+    #     lora_config = LoraConfig(
+    #         task_type=TaskType.CAUSAL_LM,
+    #         r=args.lora_rank, target_modules=lora_modules, 
+    #         lora_alpha=args.lora_rank, lora_dropout=0., enable_lora=[True]
+    #     )
+    #     model = get_peft_model(model, lora_config)
+    #     model.print_trainable_parameters()
     
     logger.info(f"Model dtype: {model.dtype}\n")
     logger.info(f"\nModel structure:\n{model}\n")
