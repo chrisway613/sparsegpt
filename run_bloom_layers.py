@@ -691,10 +691,9 @@ if __name__ == '__main__':
                                 mask = MASK[name].to(device=module.weight.device, dtype=module.weight.dtype)
                                 module.weight.data = module.weight.data * mask
                                 
-                                del mask
-                                gc.collect()
-
-                        torch.cuda.empty_cache()
+                    del target, mask
+                    gc.collect()
+                    torch.cuda.empty_cache()
         
         epoch_loss /= len(train_dataloader)
         epoch_similarity /= len(train_dataloader)

@@ -2,7 +2,7 @@
 
 LOG=${1}
 
-CUDA_VISIBLE_DEVICES=5,6 \
+CUDA_VISIBLE_DEVICES=6,7 \
 nohup accelerate launch run_bloom_blockwise_clm.py \
     --model_name bigscience/bloom \
     --model_name_or_path /ssd6/xiangyangkan/models/huggingface-models/bloom-176b \
