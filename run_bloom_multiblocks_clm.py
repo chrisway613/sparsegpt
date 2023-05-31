@@ -116,18 +116,10 @@ def sequential_eval(
     mode = model.training
     use_cache = model.config.use_cache
     model.config.use_cache = False
-
     model.eval()
 
-    # Embedding layer
-    word_embed = model.transformer.word_embeddings
-    word_embed_ln = model.transformer.word_embeddings_layernorm
     # All BloomBlocks
     layers = model.transformer.h
-    # LayerNorm
-    ln_f = model.transformer.ln_f
-    # Language head
-    lm_head = model.lm_head
 
     dev = accelerator.device
     dtype = next(iter(model.parameters())).dtype
@@ -139,11 +131,9 @@ def sequential_eval(
     for batch in tqdm(dataloader, disable=not accelerator.is_local_main_process):
         ''' CPU -> GPU '''
 
-        # Embedding layer & the 1st Layer Norm
-        model.transformer.word_embeddings = word_embed = accelerator.prepare_model(word_embed)
-        model.transformer.word_embeddings_layernorm = word_embed_ln = accelerator.prepare_model(word_embed_ln)
-        # The 1st BloomBlock
-        layers[0] = accelerator.prepare_model(layers[0])
+        model.transformer.word_embeddings.to(dev)
+        model.transformer.word_embeddings_layernorm.to(dev)
+        layers[0].to(dev)
 
         ''' Collect output hidden states from embedding layer '''
 
@@ -153,59 +143,46 @@ def sequential_eval(
             (batch_size, seq_length, hidden_size),
             dtype=dtype, device='cpu'
         )
-        # 记录当前 forward 到第几个 BloomBlock 以及对应的一些状态
+        
         cache = {'layer_i': 0, 'attention_mask': None, 'alibi': None}
-        # 以下会仅经过了：Embedding 层 -> LayerNorm -> the 1st BloomBlock
-        # 从而将每个样本在输入第一个 BloomBlock 前的 hidden state 记录下来
-        layers[0] = Catcher(layers[0], cache, hs)
-        for sample_i in range(batch_size):
-            sample = {k: v[sample_i].unsqueeze(0).to(dev) for k, v in batch.items()}
-            try:
-                model(**sample)
-            except ValueError:
-                pass
+        layers[0] = BatchCatcher(layers[0], cache, hs)
+        
+        try:
+            model(**batch)
+        except ValueError:
+            pass
 
-        # GPU -> CPU
-        layers[0] = accelerator.unwrap_model(layers[0].module).cpu()
-        model.transformer.word_embeddings = word_embed = accelerator.unwrap_model(word_embed).cpu()
-        model.transformer.word_embeddings_layernorm = word_embed_ln = accelerator.unwrap_model(word_embed_ln).cpu()
+        ''' GPU -> CPU '''
+
+        layers[0] = layers[0].module.cpu()
+        model.transformer.word_embeddings.cpu()
+        model.transformer.word_embeddings_layernorm.cpu()
 
         # Used for all layers
         alibi = cache.pop('alibi')
         attention_mask = cache.pop('attention_mask')
         del cache
 
-        accelerator._models.clear()
+        num_layers_aggregated = 5
+        for layer_start in tqdm(range(0, len(layers), num_layers_aggregated), desc="multi-layers forwarding", disable=not accelerator.is_local_main_process):
+            layer_end = min(layer_start + num_layers_aggregated, len(layers))
+            
+            sub_module = MultiBloomBlocks(*layers[layer_start:layer_end])
+            sub_module.to(dev)
 
-        # Sequential forwarding
-        for i in tqdm(range(len(layers)), desc="layer-by-layer forwarding", disable=not accelerator.is_local_main_process):
-            # CPU -> GPU
-            layers[i] = accelerator.prepare_model(layers[i])
-            # 将稀疏的部分置 0
-            if hard_sparse_weight:
-                subset = find_layers(accelerator.unwrap_model(layers[i]))
-                for name in subset:
-                    W = subset[name].weight.data
-                    # 例如稀疏率是75%，那么先有小到大排序，然后将前 75% 的参数值置0
-                    thresh = torch.sort(torch.abs(W.flatten()))[0][int(W.numel() * sparse_ratio)]
-                    W.data[torch.abs(W.data) <= thresh] = 0
-
-            for j in range(batch_size):
-                # Regard output hidden states as the input hidden states of next layer
-                hs[j] = layers[i](hs[j].unsqueeze(0).to(dev), attention_mask=attention_mask, alibi=alibi)[0]
-
-            # GPU -> CPU
-            layers[i] = accelerator.unwrap_model(layers[i]).cpu()
-
-            accelerator._models.clear()
+            hs = sub_module(hs.to(dev), attention_mask=attention_mask, alibi=alibi)[0]
+            
+            sub_module.cpu()
+            del sub_module
         
-        # CPU -> GPU
-        model.transformer.ln_f = ln_f = accelerator.prepare_model(ln_f)
-        model.lm_head = lm_head = accelerator.prepare_model(lm_head)
+        ''' CPU -> GPU '''
+
+        model.transformer.ln_f.to(dev)
+        model.lm_head.to(dev)
 
         batch_loss = []
         for hs_sample, label in tqdm(zip(hs, batch['labels']), desc="per-sample counting loss", disable=not accelerator.is_local_main_process):
-            logits = lm_head(ln_f(hs_sample.unsqueeze(0).to(dev)))
+            logits = model.lm_head(model.transformer.ln_f(hs_sample.unsqueeze(0).to(dev)))
             # Current token predict the next one
             logits = logits[:, :-1, :].contiguous()
             shift_labels = label.unsqueeze(0)[..., 1:].contiguous()
@@ -215,15 +192,14 @@ def sequential_eval(
             batch_loss.append(loss)
             del logits, shift_labels, loss
 
-        # GPU -> CPU
-        model.transformer.ln_f = ln_f = accelerator.unwrap_model(ln_f).cpu()
-        model.lm_head = lm_head = accelerator.unwrap_model(lm_head).cpu()
+        ''' GPU -> CPU '''
+
+        model.lm_head.cpu()
+        model.transformer.ln_f.cpu()
 
         # (num_devices*batch_size,)
         losses.append(accelerator.gather(torch.stack(batch_loss)))
         del batch_loss
-
-        accelerator._models.clear()
 
     losses = torch.cat(losses)
     losses = losses[:len(dataset)]
@@ -272,7 +248,7 @@ def layer_prune(
     gpts = {}
     prune_target = kwargs.pop('prune_target', '')
     # 返回一个字典，找出当前 BloomBlock 下的所有 Linear 层
-    subset = find_layers(layer)
+    subset = find_layers(layer, name=kwargs.pop("prefix", ""))
     for name in subset:
         if prune_target in name:
             gpts[name] = SparseGPT(subset[name]) if pruner == 'sparsegpt' else ABCSolver(subset[name])
@@ -390,6 +366,12 @@ def parse_args():
         type=int,
         default=None,
         help="The maximum number of training samples."
+    )
+    parser.add_argument(
+        "--num_train_samples_for_dataloader",
+        type=int,
+        default=None,
+        help="Number of train samples feed to dataloader."
     )
     parser.add_argument(
         "--learning_rate",
@@ -512,8 +494,13 @@ def parse_args():
     parser.add_argument(
         "--dense_metric",
         type=float,
-        default=0.,
+        default=None,
         help="Metric of dense, used for evaluating sparse model."
+    )
+    parser.add_argument(
+        "--eval_finetuned_sparse",
+        action="store_true",
+        help="Eval finetuned sparse model."
     )
 
     # Global
@@ -697,7 +684,6 @@ if __name__ == '__main__':
     logger.info(f"\tNum validation data = {len(val_data)}")
     if not args.eval_only:
         logger.info(f"\tNum training data = {len(train_data)}")
-    logger.info("\n")
 
     # Log a few random samples from the training set:
     for index in random.sample(range(len(train_data)), 3):
@@ -708,13 +694,13 @@ if __name__ == '__main__':
         val_data, batch_size=args.per_device_eval_batch_size,
         collate_fn=default_data_collator, pin_memory=True, num_workers=8
     )
-    if not args.eval_only:
-        # NOTE: we should not shuffle here.
-        # Cuz the target of model is aligning with teacher, not the data label
-        train_dataloader = DataLoader(
-            train_data, batch_size=args.per_device_train_batch_size,
-            collate_fn=default_data_collator, pin_memory=True, num_workers=8
-        )
+    # if not args.eval_only:
+    #     # NOTE: we should not shuffle here.
+    #     # Cuz the target of model is aligning with teacher, not the data label
+    #     train_dataloader = DataLoader(
+    #         train_data, batch_size=args.per_device_train_batch_size,
+    #         collate_fn=default_data_collator, pin_memory=True, num_workers=8
+    #     )
     
     ''' Model '''
 
@@ -765,25 +751,38 @@ if __name__ == '__main__':
 
     # Data parallel
     eval_dataloader = accelerator.prepare_data_loader(eval_dataloader)
-    if not args.eval_only:
-        # For consistent with deepspeed:
-        # when intergrate with deepspeed, you must feed dataloader to acceleraotr.prepare()
-        raw_train_dataloader = train_dataloader
-        train_dataloader = accelerator.prepare_data_loader(train_dataloader)
+    # if not args.eval_only:
+    #     # For consistent with deepspeed:
+    #     # when intergrate with deepspeed, you must feed dataloader to acceleraotr.prepare()
+    #     raw_train_dataloader = train_dataloader
+    #     train_dataloader = accelerator.prepare_data_loader(train_dataloader)
 
     # Dense model evaluation
     if args.eval_dense:
         with StateStdout(logger=logger, begin="Dense model eval .."):
-            args.dense_metric = sequential_eval(model, val_data, eval_dataloader, accelerator)
+            # args.dense_metric = sequential_eval(model, val_data, eval_dataloader, accelerator)
+            # TODO: use train data to do eval, will be removed future
+            dataloader = DataLoader(
+                train_data, batch_size=args.per_device_train_batch_size,
+                collate_fn=default_data_collator, pin_memory=True, num_workers=8
+            )
+            dataloader = accelerator.prepare_data_loader(dataloader)
+            args.dense_metric = sequential_eval(model, train_data, dataloader, accelerator)
+            
+            del dataloader
+            gc.collect()
+
+    if args.dense_metric is not None:
+        logger.info(f"Dense perplexity: {args.dense_metric}")
 
     # Log global messages
     per_device_batch_size = args.per_device_train_batch_size \
         if not args.eval_only else args.per_device_eval_batch_size
     total_batch_size = per_device_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
     num_examples = len(train_data) if not args.eval_only else len(val_data)
-    if not args.eval_only:
-        num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-        total_steps = num_update_steps_per_epoch * args.num_train_epochs
+    # if not args.eval_only:
+    #     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    #     total_steps = num_update_steps_per_epoch * args.num_train_epochs
 
     logger.info("\n***** BEGIN *****")
     logger.info(f"  Num examples = {num_examples}")
@@ -792,7 +791,7 @@ if __name__ == '__main__':
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     if not args.eval_only:
         logger.info(f"  Num Epochs = {args.num_train_epochs}")
-        logger.info(f"  Total optimization steps = {total_steps}")
+        # logger.info(f"  Total optimization steps = {total_steps}")
         logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
 
     # Eval only
@@ -807,348 +806,384 @@ if __name__ == '__main__':
         model.transformer.ln_f.requires_grad_(False)
         model.lm_head.requires_grad_(False)
 
-        hidden_size = model.config.hidden_size
         dtype = model.dtype
+        # Current cuda device
+        dev = accelerator.device
 
         use_cache = model.config.use_cache
         model.config.use_cache = False
 
         # BloomBlocks
         layers = model.transformer.h
+        hidden_size = model.config.hidden_size
 
-        # Hidden states from previous sparse layer
-        hs_batches = []
-        # Hidden states from teacher
-        teacher_hs_batches = []
+        num_sub_modules = int(math.ceil(len(layers) / args.num_layers_aggregated))
+        finish_prune = [False] * num_sub_modules
 
-        alibi_batches = []
-        attention_mask_batches = []
+        if not args.num_train_samples_for_dataloader:
+            args.num_train_samples_for_dataloader = len(train_data)
 
-        # Output hidden states from previous dense layer for pruning
-        prune_hidden_states = []
-        prune_alibis = []
-        prune_attention_masks = []
-
-        # Current cuda device
-        dev = accelerator.device
-
-        # TODO: build dataloader for sub-dataset
-
-        # Collect outputs from embedding layer, that is, initial batched hidden states.
-        with StateStdout(logger=logger, begin="Collecting outputs from embedding layer.."):
-            ''' CPU -> GPU '''
-
-            model.transformer.word_embeddings.to(dev)
-            model.transformer.word_embeddings_layernorm.to(dev)
-            layers[0].to(dev)
-
-            # Collected hidden states
-            hs = torch.zeros(
-                (per_device_batch_size, args.max_seq_length, hidden_size),
-                dtype=dtype, device=dev
-            )
-            # 记录当前 forward 到第几个 BloomBlock 以及对应的一些状态
-            cache = {'attention_mask': None, 'alibi': None}
-            # 以下会仅经过了：Embedding 层 -> LayerNorm -> the 1st BloomBlock
-            # 从而将每个样本在输入第一个 BloomBlock 前的 hidden state 记录下来
-            layers[0] = BatchCatcher(layers[0], cache, hs)
-
-            for batch in tqdm(train_dataloader, desc="Collect output embeddings", disable=not accelerator.is_local_main_process):
-                # BloomBlock 前的部分(Embedding 层)不需要梯度
-                with torch.no_grad():
-                    try:
-                        model(**batch)
-                    except ValueError:
-                        pass
-
-                # Collect outputs from embedding layer
-                # Note: remember to put them on cpu in case of running out of gpu memory.
-                hs_batches.append(hs.cpu())
-                teacher_hs_batches.append(hs_batches[-1].clone())
-                alibi_batches.append(cache['alibi'].cpu())
-                attention_mask_batches.append(cache['attention_mask'].cpu())
-
-            # Extract layer from BatchCacher
-            layers[0] = layers[0].module
-
-            ''' GPU -> CPU '''
-
-            layers[0].cpu()
-            model.transformer.word_embeddings.cpu()
-            model.transformer.word_embeddings_layernorm.cpu()
-
-            # We don't need train dataloader anymore,
-            # cuz all batched hidden states has been cached. 
-            del hs, cache, train_dataloader
-            gc.collect()
-            torch.cuda.empty_cache()
-
-        # Multi-blocks forwarding, i.e. 
-        # it is turn to the next multiple blocks only after the previous multiple blocks done with all batches
-        for layer_i in range(0, len(layers), args.num_layers_aggregated):
-            layer_j = min(layer_i + args.num_layers_aggregated, len(layers))
-            sub_modules = MultiBloomBlocks(*layers[layer_i:layer_j])
-            logger.info(f"sub-modules dtype: {next(iter(sub_modules.parameters())).dtype}")
-
-            msg = "Collecting output hidden states from teacher.."
-            with StateStdout(logger=logger, begin=msg):
-                sub_modules.eval()
-                sub_modules.to(dev)
-
-                with torch.no_grad():                    
-                    for batch_i, batch in tqdm(
-                        enumerate(teacher_hs_batches), desc="Collect teacher outputs",
-                        disable=not accelerator.is_local_main_process
-                    ):
-                        ''' CPU -> GPU '''
-
-                        # Output hidden states from previous dense layer
-                        teacher_hs = teacher_hs_batches[batch_i].to(dev)
-                        alibi = alibi_batches[batch_i].to(dev)
-                        attention_mask = attention_mask_batches[batch_i].to(dev)
-
-                        # [BE CAREFUL] detach and thus cut out the relationship between layers
-                        teacher_hs_batches[batch_i] = sub_modules(teacher_hs, attention_mask=attention_mask, alibi=alibi)[0].cpu()
-
-                        ''' Release memories '''
-
-                        del teacher_hs, alibi, attention_mask
-                        gc.collect()
-                        torch.cuda.empty_cache()
-
-                sub_modules.cpu()
-                sub_modules.train()
-
-            # Init lr
-            lr = args.learning_rate
-
-            # Optimizer
-            if args.optimizer_type == 'adamw':
-                optimizer = torch.optim.AdamW(sub_modules.parameters(), lr=lr)
-            elif args.optimizer_type == 'sgd':
-                optimizer = torch.optim.SGD(sub_modules.parameters(), lr)
-            else:
-                raise NotImplementedError(f"Got not supported optimizer: {args.optimizer_type}.")
-
-            # Lr scheduler
-            num_update_steps_total = math.ceil(len(raw_train_dataloader) / args.gradient_accumulation_steps) * args.num_train_epochs
-            lr_scheduler = get_scheduler(
-                name=args.lr_scheduler_type,
-                optimizer=optimizer,
-                num_warmup_steps=args.num_warmup_steps * accelerator.gradient_accumulation_steps,
-                num_training_steps=num_update_steps_total * accelerator.gradient_accumulation_steps
-            )
+        for start_data_index in range(0, len(train_data), args.num_train_samples_for_dataloader):
+            with StateStdout(logger=logger, begin="Building sub-dataset.."):
+                end_data_index = min(start_data_index + args.num_train_samples_for_dataloader, len(train_data))
+                sub_train_data = Subset(train_data, range(start_data_index, end_data_index))
+            logger.info(f"Sub dataset indices: [{start_data_index}, {end_data_index})")
             
-            # For consistent with deepspeed, must put them together to 'prepare()'
-            sub_modules, train_dataloader, optimizer, lr_scheduler = accelerator.prepare(
-                sub_modules, raw_train_dataloader,
-                optimizer, lr_scheduler
+            raw_train_dataloader = DataLoader(
+                sub_train_data, batch_size=args.per_device_train_batch_size,
+                collate_fn=default_data_collator, pin_memory=True, num_workers=8
             )
-            unwrapped_modules = accelerator.unwrap_model(sub_modules)
+            train_dataloader = accelerator.prepare_data_loader(raw_train_dataloader)
 
-             # NOTE: here, step means number of epochs
-            completed_step = 0
-            completed_prune_times = 0
-            # Only show the progress bar once on each machine.
-            progress_bar = tqdm(range(total_steps), desc=f"Training layer {layer_i + 1}~{layer_j}", disable=not accelerator.is_local_main_process)
+            num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+            total_steps = num_update_steps_per_epoch * args.num_train_epochs
 
-            for epoch in range(args.num_train_epochs):
-                # Pruning
-                if args.sparse and completed_prune_times < len(args.sparsities) \
-                    and (args.min_layer <= layer_i < args.max_layer) and \
-                        completed_step == args.sparse_steps[completed_prune_times]:
-                    sparsity = args.sparsities[completed_prune_times]
-                    
-                    ''' Random select pruning samples(hidden states) from training samples(hidden states) '''
+            # Hidden states from previous sparse layer
+            hs_batches = []
+            # Hidden states from teacher
+            teacher_hs_batches = []
 
-                    num_prune_batches = min(args.num_prune_samples // hs_batches[0].size(0), len(hs_batches))
-                    prune_batch_indices = random.sample(range(len(hs_batches)), num_prune_batches)
-                    
-                    # NOTE: .clone(): make a copy of training data to prevent influences
-                    # (num_prune_batches * train_batch_size, seq_length, hidden_size)
-                    prune_hidden_states = torch.cat([hs_batches[batch_i].clone() for batch_i in prune_batch_indices])
-                    prune_alibis = torch.cat([alibi_batches[batch_i].clone() for batch_i in prune_batch_indices])
-                    prune_attention_masks = torch.cat([attention_mask_batches[batch_i].clone() for batch_i in prune_batch_indices])
-                    logger.info(f"{prune_hidden_states.size(0)} pruning samples selected.")
+            alibi_batches = []
+            attention_mask_batches = []
 
-                    # Per layer pruning
-                    if args.per_layer_pruning:
-                        sub_modules.cpu()
-                        for block_i, block in enumerate(unwrapped_modules):
-                            with StateStdout(logger=logger, begin=f"Pruning layer {layer_i + block_i + 1} to sparsity {sparsity} .."):
-                                layer_prune(
-                                    block, sparsity,
-                                    prune_hidden_states, prune_alibis, prune_attention_masks,
-                                    accelerator, pruner=args.pruner, prune_target=args.prune_only, percdamp=args.percdamp
-                                )
-                        sub_modules.to(dev)
-                    # Multi layers pruning
-                    else:
-                        with StateStdout(logger=logger, begin=f"Pruning layer {layer_i + 1}-{layer_j} to sparsity {sparsity} .."):
-                            layer_prune(
-                                unwrapped_modules, sparsity,
-                                prune_hidden_states, prune_alibis, prune_attention_masks,
-                                accelerator, pruner=args.pruner, prune_target=args.prune_only, percdamp=args.percdamp
-                            )
-                    
-                    completed_prune_times += 1
+            # Output hidden states from previous dense layer for pruning
+            prune_hidden_states = []
+            prune_alibis = []
+            prune_attention_masks = []
 
-                    del prune_hidden_states, prune_alibis, prune_attention_masks
-                    gc.collect()
-                    torch.cuda.empty_cache()
+            # Collect outputs from embedding layer, that is, initial batched hidden states.
+            with StateStdout(logger=logger, begin="Collecting outputs from embedding layer.."):
+                ''' CPU -> GPU '''
 
-                sub_modules.train()
-                # NOTE: Set initial gradients to None can save some memories
-                optimizer.zero_grad(set_to_none=True)
+                model.transformer.word_embeddings.to(dev)
+                model.transformer.word_embeddings_layernorm.to(dev)
+                layers[0].to(dev)
 
-                # Loss among all data
-                modules_loss = 0.
-                # Cosine similarity(vs teacher) among all data
-                modules_similarity = 0.
-
-                # Train loop
-                for batch_i, (hs, teacher_out_hs, alibi, attention_mask) in \
-                    enumerate(zip(hs_batches, teacher_hs_batches, alibi_batches, attention_mask_batches)):
-                    # Perform gradient accumulation automatically
-                    with accelerator.accumulate(sub_modules):
-                        ''' CPU -> GPU '''
-
-                        hs = hs.to(dev)
-                        teacher_out = teacher_out_hs.to(dev)
-
-                        alibi = alibi.to(dev)
-                        attention_mask = attention_mask.to(dev)
-
-                        # Forward
-                        out = sub_modules(hs, attention_mask=attention_mask, alibi=alibi)[0]
-
-                        ''' Align with teacher '''
-
-                        # Norm before computing loss, this is for stability
-                        var = out.pow(2).mean(dim=-1, keepdim=True)
-                        teacher_var = teacher_out.pow(2).mean(dim=-1, keepdim=True)
-                        loss = F.mse_loss(
-                            out * torch.rsqrt(var + 1e-8),
-                            teacher_out * torch.rsqrt(teacher_var + 1e-8)
-                        )
-                        del var, teacher_var
-
-                        # If mixed precision training, accelerator will scale loss here
-                        accelerator.backward(loss)
-                        loss = loss.item()
-                        modules_loss += loss
-
-                        ''' Cosine similarity between student & teacher '''
-
-                        # No need for gradients
-                        with torch.no_grad():
-                            sim = F.cosine_similarity(
-                                out.reshape(-1, hidden_size).float(),
-                                teacher_out.reshape(-1, hidden_size).float()
-                            ).mean()
-                        del out, teacher_out
-
-                        # Reduce across all process
-                        sim = accelerator.reduce(sim, reduction="mean").item()
-                        modules_similarity += sim
-
-                        # Update parameters
-                        optimizer.step()
-                        # Update lr
-                        lr_scheduler.step()
-
-                        optimizer.zero_grad(set_to_none=True)
-
-                    # Log training info
-                    if batch_i % 100 == 0 or batch_i == len(hs_batches) - 1:
-                        logger.info(
-                            f"epoch {epoch + 1}/{args.num_train_epochs}\t"
-                            f"step {batch_i + 1}/{len(hs_batches)}\t"
-                            f"lr {optimizer.param_groups[0]['lr']}\t"
-                            f"loss {loss}\tsimilarity {sim}\t"
-                            f"mean loss {modules_loss / (batch_i + 1)}\t"
-                            f"mean similarity {modules_similarity / (batch_i + 1)}\n"
-                        )
-
-                    # Checks if the accelerator has performed an optimization step behind the scenes
-                    if accelerator.sync_gradients:
-                        completed_step += 1
-                        progress_bar.update()
-                        
-                        # Apply sparse mask
-                        if MASK:
-                            with torch.no_grad():
-                                if args.per_layer_pruning:
-                                    for block_i, block in enumerate(unwrapped_modules):
-                                        subset = find_layers(block)
-                                        for name, module in subset.items():
-                                            mask = MASK[name].to(module.weight.device)
-                                            module.weight.data = module.weight.data * mask
-                                else:
-                                    subset = find_layers(unwrapped_modules)
-                                    for name, module in subset.items():
-                                        mask = MASK[name].to(module.weight.device)
-                                        module.weight.data = module.weight.data * mask
-
-                            del subset, mask
-                            gc.collect()
-                            torch.cuda.empty_cache()
-
-                modules_loss /= len(hs_batches)
-                modules_similarity /= len(hs_batches)
-                logger.info(
-                    f"[Layer {layer_i + 1}~{layer_j}]\t Epoch {epoch + 1}\t"
-                    f"Loss {modules_loss}\t Similarity {modules_similarity}\n"
+                # Collected hidden states
+                hs = torch.zeros(
+                    (per_device_batch_size, args.max_seq_length, hidden_size),
+                    dtype=dtype, device=dev
                 )
-                
-                ''' Release memories '''
+                # 记录当前 forward 到第几个 BloomBlock 以及对应的一些状态
+                cache = {'attention_mask': None, 'alibi': None}
+                # 以下会仅经过了：Embedding 层 -> LayerNorm -> the 1st BloomBlock
+                # 从而将每个样本在输入第一个 BloomBlock 前的 hidden state 记录下来
+                layers[0] = BatchCatcher(layers[0], cache, hs)
 
+                for batch in tqdm(train_dataloader, desc="Collect output embeddings", disable=not accelerator.is_local_main_process):
+                    # BloomBlock 前的部分(Embedding 层)不需要梯度
+                    with torch.no_grad():
+                        try:
+                            model(**batch)
+                        except ValueError:
+                            pass
+
+                    # Collect outputs from embedding layer
+                    # Note: remember to put them on cpu in case of running out of gpu memory.
+                    hs_batches.append(hs.cpu())
+                    teacher_hs_batches.append(hs_batches[-1].clone())
+                    alibi_batches.append(cache['alibi'].cpu())
+                    attention_mask_batches.append(cache['attention_mask'].cpu())
+
+                # Extract layer from BatchCacher
+                layers[0] = layers[0].module
+
+                ''' GPU -> CPU '''
+
+                layers[0].cpu()
+                model.transformer.word_embeddings.cpu()
+                model.transformer.word_embeddings_layernorm.cpu()
+
+                # We don't need train dataloader anymore,
+                # cuz all batched hidden states has been cached. 
+                del hs, cache, train_dataloader
                 gc.collect()
                 torch.cuda.empty_cache()
 
-                # Done if it is close enough to teacher
-                if modules_similarity > 0.998:
-                    logger.info(f"NOTE: Similarity > 0.998, layer {layer_i + 1}~{layer_j} are DONE!\n")
+            # Multi-blocks forwarding, i.e. 
+            # it is turn to the next multiple blocks only after the previous multiple blocks done with all batches
+            for layer_i in range(0, len(layers), args.num_layers_aggregated):
+                layer_j = min(layer_i + args.num_layers_aggregated, len(layers))
+                sub_modules = MultiBloomBlocks(*layers[layer_i:layer_j])
+                logger.info(f"sub-modules dtype: {next(iter(sub_modules.parameters())).dtype}")
 
-                    remain_steps = (args.num_train_epochs - epoch - 1) * num_update_steps_per_epoch
-                    completed_step += remain_steps
-                    progress_bar.update(n=remain_steps)
+                msg = "Collecting output hidden states from teacher.."
+                with StateStdout(logger=logger, begin=msg):
+                    sub_modules.eval()
+                    sub_modules.to(dev)
 
-                    break
-            
-            # Clear sparse mask, cuz it is no use for next layer
-            MASK.clear()
-
-            # Set input hidden states for next layer
-            # Clear output hidden states from teacher(and will be set later, don't worry)
-            # hs_batches, out_batches = out_batches, []
-
-            # Collect hidden states for next layer.
-            if layer_j < len(layers):
-                with StateStdout(logger=logger, begin=f"Collecting input hidden states for next multi-layers.."):
-                    with torch.no_grad():
-                        for batch_i, (hs, alibi, attention_mask) in tqdm(
-                            enumerate(
-                                zip(hs_batches, alibi_batches, attention_mask_batches)
-                            ),
+                    with torch.no_grad():                    
+                        for batch_i, batch in tqdm(
+                            enumerate(teacher_hs_batches), desc="Collect teacher outputs",
                             disable=not accelerator.is_local_main_process
                         ):
+                            ''' CPU -> GPU '''
+
+                            # Output hidden states from previous dense layer
+                            teacher_hs = teacher_hs_batches[batch_i].to(dev)
+                            alibi = alibi_batches[batch_i].to(dev)
+                            attention_mask = attention_mask_batches[batch_i].to(dev)
+
+                            # [BE CAREFUL] detach and thus cut out the relationship between layers
+                            teacher_hs_batches[batch_i] = sub_modules(teacher_hs, attention_mask=attention_mask, alibi=alibi)[0].cpu()
+
+                            ''' Release memories '''
+
+                            del teacher_hs, alibi, attention_mask
+                            gc.collect()
+                            torch.cuda.empty_cache()
+
+                    sub_modules.cpu()
+                    sub_modules.train()
+
+                # Optimizer
+                if args.optimizer_type == 'adamw':
+                    optimizer = torch.optim.AdamW(sub_modules.parameters(), lr=args.learning_rate)
+                elif args.optimizer_type == 'sgd':
+                    optimizer = torch.optim.SGD(sub_modules.parameters(), args.learning_rate)
+                else:
+                    raise NotImplementedError(f"Got not supported optimizer: {args.optimizer_type}.")
+
+                # Lr scheduler
+                num_update_steps_total = math.ceil(len(raw_train_dataloader) / args.gradient_accumulation_steps) * args.num_train_epochs
+                lr_scheduler = get_scheduler(
+                    name=args.lr_scheduler_type,
+                    optimizer=optimizer,
+                    num_warmup_steps=args.num_warmup_steps * accelerator.gradient_accumulation_steps,
+                    num_training_steps=num_update_steps_total * accelerator.gradient_accumulation_steps
+                )
+                
+                # For consistent with deepspeed, must put them together to 'prepare()'
+                sub_modules, train_dataloader, optimizer, lr_scheduler = accelerator.prepare(
+                    sub_modules, raw_train_dataloader,
+                    optimizer, lr_scheduler
+                )
+                unwrapped_modules = accelerator.unwrap_model(sub_modules)
+
+                # NOTE: here, step means number of epochs
+                completed_step = 0
+                completed_prune_times = 0
+                # Only show the progress bar once on each machine.
+                progress_bar = tqdm(range(total_steps), desc=f"Training layer {layer_i + 1}~{layer_j}", disable=not accelerator.is_local_main_process)
+
+                sub_module_index = layer_i // args.num_layers_aggregated
+
+                for epoch in range(args.num_train_epochs):
+                    # Pruning
+                    if args.sparse and not finish_prune[sub_module_index] and completed_prune_times < len(args.sparsities) \
+                        and (args.min_layer <= layer_i < args.max_layer) and \
+                            completed_step == args.sparse_steps[completed_prune_times]:
+                        sparsity = args.sparsities[completed_prune_times]
+                        
+                        ''' Random select pruning samples(hidden states) from training samples(hidden states) '''
+
+                        num_prune_batches = min(args.num_prune_samples // hs_batches[0].size(0), len(hs_batches))
+                        prune_batch_indices = random.sample(range(len(hs_batches)), num_prune_batches)
+                        
+                        # NOTE: .clone(): make a copy of training data to prevent influences
+                        # (num_prune_batches * train_batch_size, seq_length, hidden_size)
+                        prune_hidden_states = torch.cat([hs_batches[batch_i] for batch_i in prune_batch_indices])
+                        prune_alibis = torch.cat([alibi_batches[batch_i] for batch_i in prune_batch_indices])
+                        prune_attention_masks = torch.cat([attention_mask_batches[batch_i] for batch_i in prune_batch_indices])
+                        logger.info(f"{prune_hidden_states.size(0)} pruning samples selected.")
+
+                        # Per layer pruning
+                        if args.per_layer_pruning:
+                            sub_modules.cpu()
+                            for block_i, block in enumerate(unwrapped_modules):
+                                with StateStdout(logger=logger, begin=f"Pruning layer {layer_i + block_i + 1} to sparsity {sparsity} .."):
+                                    layer_prune(
+                                        block, sparsity,
+                                        prune_hidden_states, prune_alibis, prune_attention_masks,
+                                        accelerator, pruner=args.pruner, prune_target=args.prune_only,
+                                        percdamp=args.percdamp, prefix=f"L{layer_i + block_i + 1}"
+                                    )
+                            sub_modules.to(dev)
+                        # Multi layers pruning
+                        else:
+                            with StateStdout(logger=logger, begin=f"Pruning layer {layer_i + 1}-{layer_j} to sparsity {sparsity} .."):
+                                layer_prune(
+                                    unwrapped_modules, sparsity,
+                                    prune_hidden_states, prune_alibis, prune_attention_masks,
+                                    accelerator, pruner=args.pruner, prune_target=args.prune_only,
+                                    percdamp=args.percdamp, prefix=f"L{layer_i + 1}_{layer_j}"
+                                )
+                        
+                        completed_prune_times += 1
+                        if completed_prune_times == len(args.sparsities):
+                            finish_prune[sub_module_index] = True
+
+                        del prune_hidden_states, prune_alibis, prune_attention_masks
+                        gc.collect()
+                        torch.cuda.empty_cache()
+
+                    sub_modules.train()
+                    # NOTE: Set initial gradients to None can save some memories
+                    optimizer.zero_grad(set_to_none=True)
+
+                    # Loss among all data
+                    modules_loss = 0.
+                    # Cosine similarity(vs teacher) among all data
+                    modules_similarity = 0.
+
+                    # Train loop
+                    for batch_i, (hs, teacher_out_hs, alibi, attention_mask) in \
+                        enumerate(zip(hs_batches, teacher_hs_batches, alibi_batches, attention_mask_batches)):
+                        # Perform gradient accumulation automatically
+                        with accelerator.accumulate(sub_modules):
+                            ''' CPU -> GPU '''
+
                             hs = hs.to(dev)
+                            teacher_out = teacher_out_hs.to(dev)
+
                             alibi = alibi.to(dev)
                             attention_mask = attention_mask.to(dev)
-                            hs_batches[batch_i] = sub_modules(hs, attention_mask=attention_mask, alibi=alibi)[0].detach().cpu()
 
-                    del hs, alibi, attention_mask
+                            # Forward
+                            out = sub_modules(hs, attention_mask=attention_mask, alibi=alibi)[0]
+
+                            ''' Align with teacher '''
+
+                            # Norm before computing loss, this is for stability
+                            var = out.pow(2).mean(dim=-1, keepdim=True)
+                            teacher_var = teacher_out.pow(2).mean(dim=-1, keepdim=True)
+                            loss = F.mse_loss(
+                                out * torch.rsqrt(var + 1e-8),
+                                teacher_out * torch.rsqrt(teacher_var + 1e-8)
+                            )
+                            del var, teacher_var
+
+                            # If mixed precision training, accelerator will scale loss here
+                            accelerator.backward(loss)
+                            loss = loss.item()
+                            modules_loss += loss
+
+                            ''' Cosine similarity between student & teacher '''
+
+                            # No need for gradients
+                            with torch.no_grad():
+                                sim = F.cosine_similarity(
+                                    out.reshape(-1, hidden_size).float(),
+                                    teacher_out.reshape(-1, hidden_size).float()
+                                ).mean()
+                            del out, teacher_out
+
+                            # Reduce across all process
+                            sim = accelerator.reduce(sim, reduction="mean").item()
+                            modules_similarity += sim
+
+                            # Update parameters
+                            optimizer.step()
+                            # Update lr
+                            lr_scheduler.step()
+
+                            optimizer.zero_grad(set_to_none=True)
+
+                        # Log training info
+                        if batch_i % 100 == 0 or batch_i == len(hs_batches) - 1:
+                            logger.info(
+                                f"epoch {epoch + 1}/{args.num_train_epochs}\t"
+                                f"step {batch_i + 1}/{len(hs_batches)}\t"
+                                f"lr {optimizer.param_groups[0]['lr']}\t"
+                                f"loss {loss}\tsimilarity {sim}\t"
+                                f"mean loss {modules_loss / (batch_i + 1)}\t"
+                                f"mean similarity {modules_similarity / (batch_i + 1)}\n"
+                            )
+
+                        # Checks if the accelerator has performed an optimization step behind the scenes
+                        if accelerator.sync_gradients:
+                            completed_step += 1
+                            progress_bar.update()
+                            
+                            # Apply sparse mask
+                            if MASK:
+                                with torch.no_grad():
+                                    if args.per_layer_pruning:
+                                        for block_i, block in enumerate(unwrapped_modules):
+                                            subset = find_layers(block, name=f"L{layer_i + block_i + 1}")
+                                            for name, module in subset.items():
+                                                mask = MASK[name].to(module.weight.device)
+                                                module.weight.data = module.weight.data * mask
+                                    else:
+                                        subset = find_layers(unwrapped_modules, name=f"L{layer_i + 1}_{layer_j}")
+                                        for name, module in subset.items():
+                                            mask = MASK[name].to(module.weight.device)
+                                            module.weight.data = module.weight.data * mask
+
+                                del subset, mask
+                                gc.collect()
+                                torch.cuda.empty_cache()
+
+                    modules_loss /= len(hs_batches)
+                    modules_similarity /= len(hs_batches)
+                    logger.info(
+                        f"[Layer {layer_i + 1}~{layer_j}]\t Epoch {epoch + 1}\t"
+                        f"Loss {modules_loss}\t Similarity {modules_similarity}\n"
+                    )
+                    
+                    ''' Release memories '''
+
                     gc.collect()
                     torch.cuda.empty_cache()
 
-            ''' Releases all references to the internal objects stored and call the garbage collector '''
+                    # Done if it is close enough to teacher
+                    if modules_similarity > 0.998:
+                        logger.info(f"NOTE: Similarity > 0.998, layer {layer_i + 1}~{layer_j} are DONE!\n")
 
-            for layer_ind in range(layer_i, layer_j):
-                layers[layer_ind].cpu()
-            del sub_modules, unwrapped_modules, optimizer, lr_scheduler, train_dataloader
-            accelerator.clear()
-          
+                        remain_steps = (args.num_train_epochs - epoch - 1) * num_update_steps_per_epoch
+                        completed_step += remain_steps
+                        progress_bar.update(n=remain_steps)
+
+                        break
+
+                # Clear sparse mask, cuz it is no use for next layer if we only train 1 loop with dataloader.
+                if args.num_train_samples_for_dataloader == len(train_data):
+                    MASK.clear()
+                
+                # Collect hidden states for next layer.
+                if layer_j < len(layers):
+                    with StateStdout(logger=logger, begin=f"Collecting input hidden states for next multi-layers.."):
+                        with torch.no_grad():
+                            for batch_i, (hs, alibi, attention_mask) in tqdm(
+                                enumerate(
+                                    zip(hs_batches, alibi_batches, attention_mask_batches)
+                                ),
+                                disable=not accelerator.is_local_main_process
+                            ):
+                                hs = hs.to(dev)
+                                alibi = alibi.to(dev)
+                                attention_mask = attention_mask.to(dev)
+                                hs_batches[batch_i] = sub_modules(hs, attention_mask=attention_mask, alibi=alibi)[0].detach().cpu()
+
+                        del hs, alibi, attention_mask
+                        gc.collect()
+                        torch.cuda.empty_cache()
+
+                # GPU -> CPU
+                for layer_ind in range(layer_i, layer_j):
+                    layers[layer_ind].cpu()
+                del sub_modules, unwrapped_modules, optimizer, lr_scheduler, train_dataloader
+
+                # Do eval for finetuned sparse model if needed.
+                if args.eval_finetuned_sparse:
+                    with StateStdout(logger=logger, begin=f"Eval finetuned layer {layer_i + 1}~{layer_j}.."):
+                        # TODO: use train data to do eval, future will use val data instead
+                        dataloader = DataLoader(
+                            train_data, batch_size=args.per_device_train_batch_size * 2,
+                            collate_fn=default_data_collator, pin_memory=True, num_workers=8
+                        )
+                        # Ditributed setup
+                        dataloader = accelerator.prepare_data_loader(dataloader)
+                        sequential_eval(model, train_data, dataloader, accelerator)
+
+                        del dataloader
+                
+                # Releases all references to the internal objects stored and call the garbage collector
+                accelerator.clear()
+
+        # Clear sparse mask.
+        MASK.clear()
+
         model.config.use_cache = use_cache
         del hs_batches, teacher_hs_batches, alibi_batches, attention_mask_batches
 

@@ -11,21 +11,23 @@ nohup accelerate launch run_bloom_multiblocks_clm.py \
     --dataset_config_name wikitext-2-raw-v1 \
     --data_cache_dir /ssd1/datasets/wikitext \
     --max_seq_length 512 \
-    --num_train_epochs 100 \
+    --num_train_epochs 1 \
+    --max_num_train_samples 960 \
     --per_device_train_batch_size 8 \
     --per_device_eval_batch_size 8 \
-    --max_num_train_samples 960 \
     --gradient_accumulation_steps 5 \
-    --learning_rate 2e-4 \
+    --learning_rate 1e-2 \
     --optimizer_type adamw \
     --lr_scheduler_type linear \
-    --num_prune_samples 160 \
     --sparse \
-    --sparsities 0.875 \
+    --sparsities 0.5 \
     --sparse_steps 0 \
     --pruner abc_solver \
     --percdamp 0.1 \
+    --num_prune_samples 160 \
     --num_layers_aggregated 5 \
+    --dense_metric 24.23 \
     --mixed_precision bf16 \
-    --output_dir bloom-7b1-8x-5blocks \
+    --eval_finetuned_sparse \
+    --output_dir bloom-7b1-2x-5blocks \
     >> $LOG.log 2>&1 &
