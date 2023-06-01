@@ -157,13 +157,19 @@ class SparseGPT:
     def __init__(self, layer):
         self.layer = layer
         self.dev = self.layer.weight.device
+        
         W = layer.weight.data.clone()
         if isinstance(self.layer, nn.Conv2d):
             W = W.flatten(1)
         if isinstance(self.layer, transformers.Conv1D):
             W = W.t()
+        
         self.rows = W.shape[0]
         self.columns = W.shape[1]
+
+        del W
+        gc.collect()
+
         self.H = torch.zeros((self.columns, self.columns), device=self.dev)
         self.nsamples = 0
 

@@ -28,7 +28,7 @@ from transformers.models.bloom import BloomConfig, BloomTokenizerFast, BloomForC
 
 from transformers.models.bloom.modeling_bloom import BloomBlock
 
-from peft import LoraConfig, TaskType, get_peft_model
+# from peft import LoraConfig, TaskType, get_peft_model
 
 from modelutils import find_layers
 from sparsegpt import SparseGPT, ABCSolver
@@ -108,7 +108,7 @@ def disable_torch_init():
 
 @torch.no_grad()
 def sequential_eval(
-    model: nn.Module, dataset, dataloader, accelerator: Accelerator,
+    model: nn.Module, num_layers_aggregated, dataset, dataloader, accelerator: Accelerator,
     hard_sparse_weight: bool = False, sparse_ratio: float = 0., verbose: bool = True
 ):
     """ Evaluation in sequential forwarding way. """
@@ -163,7 +163,6 @@ def sequential_eval(
         attention_mask = cache.pop('attention_mask')
         del cache
 
-        num_layers_aggregated = 5
         for layer_start in tqdm(range(0, len(layers), num_layers_aggregated), desc="multi-layers forwarding", disable=not accelerator.is_local_main_process):
             layer_end = min(layer_start + num_layers_aggregated, len(layers))
             
@@ -199,7 +198,8 @@ def sequential_eval(
 
         # (num_devices*batch_size,)
         losses.append(accelerator.gather(torch.stack(batch_loss)))
-        del batch_loss
+        del batch_loss, hs
+        gc.collect()
 
     losses = torch.cat(losses)
     losses = losses[:len(dataset)]
@@ -736,15 +736,15 @@ if __name__ == '__main__':
         model.resize_token_embeddings(len(tokenizer))
 
     # Enable lora
-    if args.lora:
-        lora_modules = ["query_key_value", "self_attention.dense", "dense_h_to_4h", "dense_4h_to_h"]
-        lora_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            r=args.lora_rank, target_modules=lora_modules, 
-            lora_alpha=args.lora_rank, lora_dropout=0., enable_lora=[True]
-        )
-        model = get_peft_model(model, lora_config)
-        model.print_trainable_parameters()
+    # if args.lora:
+    #     lora_modules = ["query_key_value", "self_attention.dense", "dense_h_to_4h", "dense_4h_to_h"]
+    #     lora_config = LoraConfig(
+    #         task_type=TaskType.CAUSAL_LM,
+    #         r=args.lora_rank, target_modules=lora_modules, 
+    #         lora_alpha=args.lora_rank, lora_dropout=0., enable_lora=[True]
+    #     )
+    #     model = get_peft_model(model, lora_config)
+    #     model.print_trainable_parameters()
     
     logger.info(f"Model dtype: {model.dtype}\n")
     logger.info(f"\nModel structure:\n{model}\n")
@@ -767,7 +767,7 @@ if __name__ == '__main__':
                 collate_fn=default_data_collator, pin_memory=True, num_workers=8
             )
             dataloader = accelerator.prepare_data_loader(dataloader)
-            args.dense_metric = sequential_eval(model, train_data, dataloader, accelerator)
+            args.dense_metric = sequential_eval(model, args.num_layers_aggregated, train_data, dataloader, accelerator)
             
             del dataloader
             gc.collect()
@@ -797,7 +797,7 @@ if __name__ == '__main__':
     # Eval only
     if args.eval_only:
         with StateStdout(logger=logger, begin="NOTE: Program for Eval only"):
-            sequential_eval(model, val_data, eval_dataloader, accelerator)
+            sequential_eval(model, args.num_layers_aggregated, val_data, eval_dataloader, accelerator)
     # Train(& Prune)
     else:
         # NOTE: We only train BloomBlocks
@@ -1063,8 +1063,8 @@ if __name__ == '__main__':
                             # No need for gradients
                             with torch.no_grad():
                                 sim = F.cosine_similarity(
-                                    out.reshape(-1, hidden_size).float(),
-                                    teacher_out.reshape(-1, hidden_size).float()
+                                    out.reshape(-1, hidden_size),
+                                    teacher_out.reshape(-1, hidden_size)
                                 ).mean()
                             del out, teacher_out
 
@@ -1174,7 +1174,7 @@ if __name__ == '__main__':
                         )
                         # Ditributed setup
                         dataloader = accelerator.prepare_data_loader(dataloader)
-                        sequential_eval(model, train_data, dataloader, accelerator)
+                        sequential_eval(model, args.num_layers_aggregated, train_data, dataloader, accelerator)
 
                         del dataloader
                 
