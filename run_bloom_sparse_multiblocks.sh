@@ -20,7 +20,7 @@ nohup accelerate launch run_bloom_multiblocks_clm.py \
     --optimizer_type adamw \
     --lr_scheduler_type linear \
     --sparse \
-    --sparsities 0.5 \
+    --sparsities 0.75 \
     --sparse_steps 0 \
     --pruner abc_solver \
     --percdamp 0.1 \
@@ -29,5 +29,5 @@ nohup accelerate launch run_bloom_multiblocks_clm.py \
     --eval_dense \
     --eval_finetuned_sparse \
     --mixed_precision bf16 \
-    --output_dir bloom-7b1-2x-3blocks \
+    --output_dir bloom-7b1-4x-3blocks \
     >> $LOG.log 2>&1 &

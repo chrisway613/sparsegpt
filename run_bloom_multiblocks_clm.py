@@ -767,7 +767,10 @@ if __name__ == '__main__':
                 collate_fn=default_data_collator, pin_memory=True, num_workers=8
             )
             dataloader = accelerator.prepare_data_loader(dataloader)
-            args.dense_metric = sequential_eval(model, args.num_layers_aggregated, train_data, dataloader, accelerator)
+            args.dense_metric = sequential_eval(
+                model, args.num_layers_aggregated,
+                train_data, dataloader, accelerator
+            )
             
             del dataloader
             gc.collect()
